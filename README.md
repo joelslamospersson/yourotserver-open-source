@@ -5,3 +5,6 @@ Free to use, edit at your own accord. However, not free to copy for commercial u
 # Pre-beta 0.1
 Currently releasing and fixing issues with setup process files<br>
 You can see progression in our discord
+
+# Special thanks to..
+Optimum, vanyria.eu for testing our systems for issues
