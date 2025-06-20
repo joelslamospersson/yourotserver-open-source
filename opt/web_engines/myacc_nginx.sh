@@ -33,17 +33,15 @@ chmod 600 "$LOG_FILE"
 
 log "Starting full MyAcc+Canary setup (user=${APP_USER})"
 
-# ─── helper: read an existing "Label:\n  User: X\n  Pass: Y" block ────────
+# helper functions
 _read_cred(){
   local label="$1"
-  # find the first occurrence
   local block
   block="$(awk "/^${label}/ {flag=1; print; next} flag && /^  User:/ { print; next } flag && /^  Pass:/ { print; exit }" "$PMA_CRED_FILE" || true)"
   R_USER="$(echo "$block" | awk '/^  User:/ {print $2}')"
   R_PASS="$(echo "$block" | awk '/^  Pass:/ {print $2}')"
 }
 
-# ─── helper: append a new credential block ─────────────────────────────────
 _append_cred(){
   local label="$1" user="$2" pass="$3"
   {
@@ -53,15 +51,15 @@ _append_cred(){
   } >> "$PMA_CRED_FILE"
 }
 
-# ─── 1) nginx ─────────────────────────────────────────────────────────────
+# --- install Nginx ---
 if ! dpkg -l nginx &>/dev/null; then
-  log "[1/14] apt install nginx"
+  log "[1/14] installing nginx"
   apt update && apt install -y nginx
 else
   log "[1/14] nginx already installed"
 fi
 
-# ─── 2a) Make sure ufw is installed ──────────────────────────────────────────
+# --- install UFW ---
 if ! dpkg -l ufw &>/dev/null; then
   log "[2/14] installing ufw"
   apt update && apt install -y ufw
@@ -69,7 +67,6 @@ else
   log "[2/14] ufw already installed"
 fi
 
-# ─── 2b) make sure ufw is enabled  ───────────────────────────────────────────────────────
 if ! ufw status | grep -q 'Status: active' &>/dev/null; then
   log "[2/14] enabling ufw"
   ufw --force enable
@@ -77,30 +74,26 @@ else
   log "[2/14] ufw already enabled"
 fi
 
-# ─── 2c) allow 80/443 ports ufw ───────────────────────────────────────
-# Allow port 80/443 for HTTP/HTTPS
 if ! ufw status | grep -q '80/tcp' &>/dev/null; then
   log "[2/14] allowing HTTP/HTTPS in ufw"
   ufw allow 80/tcp
   ufw allow 443/tcp
   ufw allow 'Nginx Full'
 else
-  log "[2/14] HTTP/HTTPS, Nginx Full already allowed in ufw"
+  log "[2/14] ports already allowed in ufw"
 fi
 
-# ─── 3) mysql-server ─────────────────────────────────────────────────────
+# --- MySQL setup ---
 if ! dpkg -l mysql-server &>/dev/null; then
-  log "[3/14] apt install mysql-server"
-  DEBIAN_FRONTEND=noninteractive apt update
-  DEBIAN_FRONTEND=noninteractive apt install -y mysql-server
+  log "[3/14] installing mysql-server"
+  DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends mysql-server mysql-client-core-8.0
 else
   log "[3/14] mysql-server already present"
 fi
 
-# ─── 4) mysql_secure_installation ─────────────────────────────────────────
 SEC_MARK="/root/.mysql_secure_done"
 if [[ ! -f $SEC_MARK ]]; then
-  log "[4/14] hardening MySQL"
+  log "[4/14] securing MySQL"
   mysql -u root <<SQL
 DELETE FROM mysql.user WHERE User='';
 UPDATE mysql.user SET Host='localhost' WHERE User='root';
@@ -113,50 +106,33 @@ else
   log "[4/14] MySQL already secured"
 fi
 
-# ─── 5) PHP-FPM & extension ────────────────────────────────────────────────
+# --- PHP ---
 if ! dpkg -l php-fpm &>/dev/null; then
-  log "[5/14] apt install php-fpm php-mysql"
-  apt update && apt install -y php-fpm php-mysql
+  log "[5/14] installing php-fpm and extensions"
+  apt install -y php-fpm php-mysql
 else
-  log "[5/14] php-fpm already installed"
+  log "[5/14] PHP already installed"
 fi
 
-# detect PHP socket & machine IP
 MACHINE_IP="$(hostname -I | awk '{print $1}')"; log "Machine IP: ${MACHINE_IP}"
 shopt -s nullglob
 php_socks=(/run/php/php*-fpm.sock /var/run/php/php*-fpm.sock)
 shopt -u nullglob
-(( ${#php_socks[@]} )) || die "Could not locate PHP-FPM socket"
-PHP_SOCK="${php_socks[0]}"; log "PHP-FPM socket: ${PHP_SOCK}"
+PHP_SOCK="${php_socks[0]}"
 
-# ─── 6) Replace default nginx vhost with template ─────────────────────────
-
-# 1) Create backup once
+# --- Nginx site ---
 if [[ ! -f "${DEF_NGINX}.bak" ]]; then
   cp "$DEF_NGINX" "${DEF_NGINX}.bak"
-  log "[6/14] Backed up $DEF_NGINX to ${DEF_NGINX}.bak"
+  log "[6/14] backed up nginx config"
 fi
 
-# 2) Detect PHP version + socket path
-MACHINE_IP="$(hostname -I | awk '{print $1}')"
-shopt -s nullglob
-php_socks=(/run/php/php*-fpm.sock /var/run/php/php*-fpm.sock)
-shopt -u nullglob
-(( ${#php_socks[@]} )) || die "Could not locate PHP-FPM socket"
-PHP_SOCK="${php_socks[0]}"
-log "[6/14] PHP-FPM socket: ${PHP_SOCK}"
-
-# 3) Replace default nginx config with full template
-cat > "$DEF_NGINX" <<'EOF'
+cat > "$DEF_NGINX" <<EOF
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
 
     root /var/www/html;
-
-    # Add index.php to the list if you are using PHP
     index index.php;
-
     server_name _;
 
     location /php_adm {
@@ -164,42 +140,26 @@ server {
         auth_basic_user_file /etc/nginx/.htpasswd;
     }
 
-    # fixed issue with nginx not serving index.php
     location / {
-        try_files $uri $uri/ /index.php?$query_string;
+        try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
-    # pass PHP scripts to FastCGI server
     location ~ \.php\$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:${PHP_SOCK};
         fastcgi_read_timeout 240;
     }
 
-    # Max upload size
     client_max_body_size 10M;
 
-    # ─── SECURITY HARDENING ───────────────────────────────
-    location ~ /system {
-        deny all;
-    }
-
-    location ~ /\.(git|ht|md|json|dist)\$ {
-        deny all;
-    }
-
-    location ~* (file://|\.%00) {
-        return 444;
-    }
-
-    location ~* /\.env.* {
-        return 403;
-    }
+    location ~ /system { deny all; }
+    location ~ /\.(git|ht|md|json|dist)\$ { deny all; }
+    location ~* (file://|\.%00) { return 444; }
+    location ~* /\.env.* { return 403; }
 }
 EOF
 
-# 4) Validate and reload Nginx
-nginx -t && systemctl reload nginx && log "[6/14] Default site replaced and reloaded"
+nginx -t && systemctl reload nginx && log "[6/14] nginx site configured"
 
 # ─── 7) install & record phpMyAdmin app password ──────────────────────────
 if ! dpkg -l phpmyadmin &>/dev/null; then
