@@ -1,189 +1,169 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 APP_USER="${1:-$SUDO_USER}"
-USER_HOME="/home/${APP_USER}"
-VCPKG_DIR="${USER_HOME}/vcpkg"
-CANARY_DIR="${USER_HOME}/canary"
-BUILD_DIR="${CANARY_DIR}/build"
+BUILD_MODE="${2:-release}"   # release / debug / both
+RAW_CACHE="${3:-no}"         # yes / no / disabled
+
+# normalize inputs
+BUILD_MODE="${BUILD_MODE,,}"
+RAW_CACHE="${RAW_CACHE,,}"
+
+case "$RAW_CACHE" in
+  yes|y|true|1) ENABLE_BINARY_CACHE="yes" ;;
+  no|n|false|0|disabled) ENABLE_BINARY_CACHE="no" ;;
+  *) die "Invalid binary-cache: $RAW_CACHE" ;;
+esac
+
+case "$BUILD_MODE" in
+  release|debug|both) ;;
+  *) die "Invalid build-mode: $BUILD_MODE" ;;
+esac
+
+# map build-mode → vcpkg triplet
+case "$BUILD_MODE" in
+  release) VCPKG_TRIPLET="x64-linux-release" ;;
+  debug)   VCPKG_TRIPLET="x64-linux-dbg"     ;;
+  both)    VCPKG_TRIPLET="x64-linux"         ;;
+esac
+export VCPKG_DEFAULT_TRIPLET="$VCPKG_TRIPLET"
 
 log(){ echo -e "\n>>> $*"; }
+if [[ $EUID -ne 0 ]]; then die "Must run as root"; fi
 
-[[ $EUID -eq 0 ]] || die "Must run as root"
+USER_HOME="/home/${APP_USER}"
+CANARY_DIR="${USER_HOME}/canary"
+VCPKG_DIR="${USER_HOME}/vcpkg"
+BUILD_DIR="${CANARY_DIR}/build"
 
-log "Starting L Canary setup for user ${APP_USER}"
+log "Starting L Canary setup for user $APP_USER"
 
-# [1/7] System update
+# ——————————————————————————————
+# [1/7] System update & core tool install
 if [[ ! -f "${USER_HOME}/.l_canary.1.done" ]]; then
-  log "[1/7] apt update && dist-upgrade"
+  log "[1/7] Updating system and installing core packages"
   apt update && apt dist-upgrade -y
+  apt install -y \
+    git \
+    build-essential \
+    autoconf \
+    libtool \
+    ca-certificates \
+    curl \
+    zip unzip tar pkg-config \
+    ninja-build \
+    ccache \
+    linux-headers-$(uname -r)
   touch "${USER_HOME}/.l_canary.1.done"
 else
   log "[1/7] skipped"
 fi
 
-# [1.1] UFW setup
-if [[ ! -f "${USER_HOME}/.l_canary.1.1.done" ]]; then
-  log "[1.1/7] installing and enabling ufw"
-  apt install -y ufw
-  ufw allow ssh
-  ufw allow 7171/tcp
-  ufw allow 7172/tcp
-  ufw --force enable
-  touch "${USER_HOME}/.l_canary.1.1.done"
-else
-  log "[1.1/7] skipped"
-fi
-
-# [SWAP] Ensure swap
-SWAPFILE=/swapfile
-if ! grep -q "^/swapfile" /etc/fstab; then
-  log "Creating 1GB swapfile"
-  fallocate -l 1G $SWAPFILE
-  chmod 600 $SWAPFILE
-  mkswap $SWAPFILE
-  swapon $SWAPFILE
-  echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
-else
-  log "Swapfile already present"
-fi
-
-# [2/7] Dependencies
+# ——————————————————————————————
+# [2/7] CMake via snap
 if [[ ! -f "${USER_HOME}/.l_canary.2.done" ]]; then
-  log "[2/7] installing system packages"
-  apt install -y \
-    git cmake build-essential autoconf libtool ca-certificates \
-    curl zip unzip tar pkg-config ninja-build ccache \
-    gcc-14 g++-14 \
-    linux-headers-$(uname -r) \
-    snapd
-
-  log "[2/7] removing apt cmake, installing snap cmake"
-  apt remove --purge -y cmake
+  log "[2/7] Upgrading CMake via snap"
+  apt remove --purge -y cmake || true
   hash -r
+  apt install -y snapd
   snap install cmake --classic
   cmake --version
-
   touch "${USER_HOME}/.l_canary.2.done"
 else
   log "[2/7] skipped"
 fi
 
-# [3/7] Configure GCC-14
-if ! command -v gcc-14 &>/dev/null; then
-  log "[3/7] installing gcc-14"
+# ——————————————————————————————
+# [3/7] Install GCC-14 and select
+if [[ ! -f "${USER_HOME}/.l_canary.3.done" ]]; then
+  log "[3/7] Installing and configuring GCC-14"
+  apt update
   apt install -y gcc-14 g++-14
-fi
-
-update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
-  --slave /usr/bin/g++ g++ /usr/bin/g++-14 \
-  --slave /usr/bin/gcov gcov /usr/bin/gcov-14
-update-alternatives --set gcc /usr/bin/gcc-14
-gcc-14 --version
-g++-14 --version
-
-# [4/7] Clone & bootstrap vcpkg
-if [[ -d "$VCPKG_DIR" && ! -d "$VCPKG_DIR/.git" ]]; then
-  log "Removing invalid vcpkg folder"
-  rm -rf "$VCPKG_DIR"
-fi
-
-if [[ ! -d "$VCPKG_DIR" ]]; then
-  log "[4/7] cloning vcpkg"
-  sudo -u "$APP_USER" git clone https://github.com/microsoft/vcpkg "$VCPKG_DIR" --quiet
-  cd "$VCPKG_DIR"
-
-  log "[4/7] detecting latest stable tag"
-  LATEST_TAG=$(git ls-remote --tags --refs https://github.com/microsoft/vcpkg.git | \
-    awk -F/ '{print $3}' | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' | sort -V | tail -n1)
-  log "Using vcpkg tag: $LATEST_TAG"
-
-  sudo -u "$APP_USER" git fetch --tags --quiet
-  sudo -u "$APP_USER" git checkout --quiet "tags/$LATEST_TAG"
-
-  # Patch to avoid unreachable crash
-  sed -i 's/unreachable("Unreachable code");//g' src/vcpkg/metrics.cpp || true
-
-  log "[4/7] bootstrapping vcpkg"
-  sudo -u "$APP_USER" env VCPKG_DISABLE_METRICS=1 ./bootstrap-vcpkg.sh
+  update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
+    --slave /usr/bin/g++ g++ /usr/bin/g++-14 \
+    --slave /usr/bin/gcov gcov /usr/bin/gcov-14
+  update-alternatives --set gcc /usr/bin/gcc-14
+  gcc --version
+  g++ --version
+  touch "${USER_HOME}/.l_canary.3.done"
 else
-  log "[4/7] skipped (already exists)"
+  log "[3/7] skipped"
 fi
 
+# ——————————————————————————————
+# [4/7] Install vcpkg
+if [[ ! -f "${USER_HOME}/.l_canary.4.done" ]]; then
+  log "[4/7] Cloning and bootstrapping vcpkg"
+  cd "${USER_HOME}"
+  rm -rf "$VCPKG_DIR"
+  git clone https://github.com/microsoft/vcpkg "$VCPKG_DIR"
+  cd "$VCPKG_DIR"
+  export VCPKG_METRICS_OPT_OUT=1
+  ./bootstrap-vcpkg.sh --disableMetrics
+  log "✅ vcpkg ready at $VCPKG_DIR/vcpkg"
+
+  # Ensure permanent metrics disable
+  log "[4/7] Ensuring vcpkg metrics disabled permanently"
+  for f in .bashrc .profile; do
+    if ! grep -q "VCPKG_METRICS_OPT_OUT=1" "${USER_HOME}/$f"; then
+      echo "export VCPKG_METRICS_OPT_OUT=1" >> "${USER_HOME}/$f"
+    fi
+  done
+
+  mkdir -p "${USER_HOME}/.vcpkg"
+  cat > "${USER_HOME}/.vcpkg/vcpkg-configuration.json" <<EOF
+{
+  "user": {
+    "sendMetrics": false
+  }
+}
+EOF
+  chown -R "$APP_USER:$APP_USER" "${USER_HOME}/.vcpkg"
+
+  touch "${USER_HOME}/.l_canary.4.done"
+else
+  log "[4/7] skipped"
+fi
+
+# ——————————————————————————————
 # [5/7] Clone Canary
-if [[ ! -d "${CANARY_DIR}" ]]; then
-  log "[5/7] cloning canary"
-  sudo -u "${APP_USER}" git clone --depth 1 https://github.com/opentibiabr/canary.git "${CANARY_DIR}"
+if [[ ! -f "${USER_HOME}/.l_canary.5.done" ]]; then
+  log "[5/7] Cloning Canary source"
+  cd "${USER_HOME}"
+  git clone --depth 1 https://github.com/opentibiabr/canary.git "$CANARY_DIR"
+  touch "${USER_HOME}/.l_canary.5.done"
 else
   log "[5/7] skipped"
 fi
+chown -R "$APP_USER:$APP_USER" "$CANARY_DIR"
 
-# Optional version patch (if needed)
-VCPKG_JSON="${CANARY_DIR}/vcpkg.json"
-if [[ -f "$VCPKG_JSON" ]]; then
-  log "[5.1] optional patch of vcpkg.json"
-  sed -i 's/"nlohmann-json": *"[^"]*"/"nlohmann-json": "3.11.3"/' "$VCPKG_JSON" || true
-  sed -i 's/"openssl": *"[^"]*"/"openssl": "3.5.0"/' "$VCPKG_JSON" || true
-fi
-chown -R "${APP_USER}:${APP_USER}" "${CANARY_DIR}"
-
-# [6/9] Build Canary
-log "[6/9] building canary"
-build_canary() {
-  rm -rf "$BUILD_DIR" "${CANARY_DIR}/canary"
-  mkdir -p "$BUILD_DIR"
-  cd "$BUILD_DIR" || return 1
-
-  cmake -DCMAKE_TOOLCHAIN_FILE="${VCPKG_DIR}/scripts/buildsystems/vcpkg.cmake" .. --preset linux-release || return 1
-  cmake --build linux-release --parallel || return 1
-}
-
-if build_canary; then
-  log "✅ Canary built successfully"
+# ——————————————————————————————
+# [6/7] Configure & build Canary
+if [[ ! -f "${USER_HOME}/.l_canary.6.done" ]]; then
+  log "[6/7] Configuring and building Canary"
+  mkdir -p "$BUILD_DIR" && cd "$BUILD_DIR"
+  cmake --preset linux-release \
+    -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" ..
+  cmake --build linux-release --parallel "$(nproc)"
+  touch "${USER_HOME}/.l_canary.6.done"
 else
-  log "Initial build failed — retrying with vcpkg reset"
-  cd /tmp
-  rm -rf "$VCPKG_DIR" "$BUILD_DIR" "${CANARY_DIR}/vcpkg_installed"
-
-  git clone https://github.com/microsoft/vcpkg "$VCPKG_DIR"
-  chown -R "$APP_USER:$APP_USER" "$VCPKG_DIR"
-  cd "$VCPKG_DIR"
-  git checkout "tags/$LATEST_TAG"
-  sed -i 's/unreachable("Unreachable code");//g' src/vcpkg/metrics.cpp || true
-  env VCPKG_DISABLE_METRICS=1 ./bootstrap-vcpkg.sh
-
-  if build_canary; then
-    log "✅ Canary rebuilt successfully"
-  else
-    die "❌ Final build failed even after vcpkg reset"
-  fi
+  log "[6/7] skipped"
 fi
 
+# ——————————————————————————————
 # [7/7] Install binary
-log "[7/7] installing binary"
-cp -f "${BUILD_DIR}/linux-release/bin/canary" "${CANARY_DIR}/canary"
-chown "${APP_USER}:${APP_USER}" "${CANARY_DIR}/canary"
-
-# [8/9] Patch config.lua
-MACHINE_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')"
-CONFIG_DIST="$CANARY_DIR/config.lua.dist"
-CONFIG="$CANARY_DIR/config.lua"
-
-[[ -f "$CONFIG" ]] || cp "$CONFIG_DIST" "$CONFIG"
-
-CURRENT_IP="$(grep -E '^ip\s*=' "$CONFIG" | sed -E 's/.*"([^"]+)".*/\1/')"
-if [[ "$CURRENT_IP" != "$MACHINE_IP" ]]; then
-  log "[8/9] patching config.lua IP to $MACHINE_IP"
-  sed -i 's|^ip\s*=.*|ip = "'"$MACHINE_IP"'"|' "$CONFIG"
+log "[7/7] Installing Canary binary"
+if [[ -x "$BUILD_DIR/linux-release/canary" ]]; then
+  SRC="$BUILD_DIR/linux-release/canary"
+elif [[ -x "$BUILD_DIR/linux-release/bin/canary" ]]; then
+  SRC="$BUILD_DIR/linux-release/bin/canary"
+else
+  die "❌ built binary not found"
 fi
-
-# [9/9] Permissions
-log "[9/9] fixing permissions"
-chmod +x "$USER_HOME"
-chmod +x "$CANARY_DIR"
-chmod 775 "${CANARY_DIR}/canary"
-chmod 775 "${CANARY_DIR}/start.sh"
+cp "$SRC" "$CANARY_DIR/canary"
+chown "$APP_USER:$APP_USER" "$CANARY_DIR/canary"
 
 log "✅ L Canary setup complete!"
 exit 0
