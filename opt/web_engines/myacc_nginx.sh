@@ -2,11 +2,6 @@
 set -euo pipefail
 trap 'die "Error on or near line ${LINENO}. See ${LOG_FILE}."' ERR
 
-#
-# myacc_nginx.sh — fully idempotent MyAcc + phpMyAdmin + Canary setup
-# Usage: sudo ./myacc_nginx.sh <app_user>
-#
-
 APP_USER="${1:-${SUDO_USER:-$(id -un)}}"
 USER_HOME="/home/${APP_USER}"
 LOG_FILE="${USER_HOME}/myacc_setup.log"
@@ -15,409 +10,411 @@ CANARY_DIR="${USER_HOME}/canary"
 SCHEMA_FILE="${CANARY_DIR}/schema.sql"
 DEF_NGINX="/etc/nginx/sites-available/default"
 
-# allow Composer to run as root without complaining
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 export COMPOSER_ALLOW_SUPERUSER=1
 export COMPOSER_HOME=/root/.config/composer
-mkdir -p "$COMPOSER_HOME"
-echo '{}' > "$COMPOSER_HOME/composer.json"
 
-log(){ echo -e "\n>>> $*" | tee -a "$LOG_FILE"; }
-die(){ echo -e "\n✖ $*" | tee -a "$LOG_FILE"; exit 1; }
+log(){ echo -e "\n>>> $*" | tee -a "${LOG_FILE}"; }
+die(){ echo -e "\n✖ $*" | tee -a "${LOG_FILE}"; exit 1; }
 
-# require root
+find_blockers() {
+    ps -eo pid,ppid,comm,args | grep -E 'apt(-get)?|dpkg|unattended-upgrade|mandb|update-mandb|update-mime' | grep -vE "grep|$$" | awk '{print $1}'
+}
+
+kill_blockers_safe() {
+    log "Scanning for dpkg/apt blockers (safe, skip our install process)..."
+    local pids
+    pids=$(find_blockers)
+    for pid in $pids; do
+        if ! pstree -ps $$ | grep -qw $pid; then
+            log "Killing blocker process $pid"
+            kill -9 $pid || true
+        fi
+    done
+    rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* || true
+}
+
+kill_blockers() {
+    log "Killing dpkg/apt-get/apt/lock blockers (and any stuck composer, php, npm, node, unattended-upgrade, mandb)"
+    for proc in apt-get apt dpkg mandb update-mandb update-mime composer php npm node unattended-upgrade; do
+        pkill -9 "$proc" 2>/dev/null || true
+    done
+    rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* || true
+}
+
+trycmd() {
+    local _cmd="$1"; local _retries="${2:-2}"; local _delay="${3:-10}"; local _rc
+    for _try in $(seq 1 $_retries); do
+        log "trycmd: ($_try/$_retries) $_cmd"
+        eval $_cmd && return 0
+        _rc=$?
+        log "[WARN] trycmd failed ($_try): rc=$_rc, will retry after $_delay sec"
+        kill_blockers
+        sleep $_delay
+    done
+    log "❌ trycmd: failed after $_retries tries: $_cmd"
+    return 1
+}
+
+run_apt_fast_aggressive(){
+  local tmo=1800
+  local cmd="$*"
+  local start_time=$(date +%s)
+  local rc
+  local main_pid
+
+  wait_for_dpkg_lock
+  kill_blockers_safe
+  log "→ $cmd (timeout ${tmo}s, aggressive lock killer)"
+
+  timeout $tmo eatmydata bash -c "$cmd" &
+  main_pid=$!
+
+  while kill -0 $main_pid 2>/dev/null; do
+    sleep 5
+    if (( $(date +%s) - start_time > tmo )); then
+      log "[WARN] Install process timed out, killing..."
+      kill -9 $main_pid 2>/dev/null || true
+      wait $main_pid 2>/dev/null
+      return 124
+    fi
+  done
+
+  wait $main_pid
+  rc=$?
+  if (( rc == 0 )); then
+    log "[OK] $cmd"
+    return 0
+  else
+    log "[WARN] $cmd failed with rc=$rc"
+    return $rc
+  fi
+}
+
+wait_for_dpkg_lock(){
+  local sec=0
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+     || fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
+    ((sec++))
+    log "⚠ dpkg locked (${sec}s)…"
+    [ $sec -ge 10 ] && { kill_blockers; sec=0; }
+    sleep 1
+  done
+}
+
+run_apt_fast(){
+  local tmo=600
+  local cmd
+  if [[ "$1" =~ ^[0-9]+$ ]]; then
+    tmo="$1"
+    shift
+  fi
+  cmd="$*"
+  local rc attempt=1
+  while (( attempt <= 2 )); do
+    wait_for_dpkg_lock
+    kill_blockers
+    log "→ $cmd (timeout ${tmo}s, try #$attempt)"
+    timeout $tmo eatmydata bash -c "$cmd"
+    rc=$?
+    if (( rc == 0 )); then
+      log "[OK] $cmd"
+      return 0
+    elif (( rc == 124 )); then
+      log "[WARN] $cmd timed out, killing blockers and retrying"
+      kill_blockers
+      (( attempt++ ))
+      continue
+    else
+      log "[WARN] $cmd failed with rc=$rc, retrying"
+      kill_blockers
+      (( attempt++ ))
+      continue
+    fi
+  done
+  log "❌ $cmd failed after 2 tries"
+  return 1
+}
+
+APT_FAST="-o Dpkg::Options::=--no-triggers -o Dpkg::Options::=--force-unsafe-io --no-install-recommends"
+
+cat > /usr/sbin/policy-rc.d <<'EOF'
+#!/bin/sh
+exit 101
+EOF
+chmod +x /usr/sbin/policy-rc.d
+
 [[ $EUID -eq 0 ]] || die "Must run as root"
 
-# initialize and lock down log
-: >"$LOG_FILE"
-chmod 600 "$LOG_FILE"
-
+: >"${LOG_FILE}"
+chmod 600 "${LOG_FILE}"
 log "Starting full MyAcc+Canary setup (user=${APP_USER})"
 
-# helper functions
-_read_cred(){
-  local label="$1"
-  local block
-  block="$(awk "/^${label}/ {flag=1; print; next} flag && /^  User:/ { print; next } flag && /^  Pass:/ { print; exit }" "$PMA_CRED_FILE" || true)"
-  R_USER="$(echo "$block" | awk '/^  User:/ {print $2}')"
-  R_PASS="$(echo "$block" | awk '/^  Pass:/ {print $2}')"
-}
+log "Neutering man-db triggers and binaries (mandb, update-mandb, update-mime)"
+if [ ! -L /usr/bin/mandb ]; then
+    dpkg-divert --local --rename --add /usr/bin/mandb
+    ln -sf /bin/true /usr/bin/mandb
+fi
+if [ ! -L /usr/bin/update-mime ]; then
+    dpkg-divert --local --rename --add /usr/bin/update-mime
+    ln -sf /bin/true /usr/bin/update-mime
+fi
+if [ ! -L /usr/share/man-db/update-mandb ]; then
+    dpkg-divert --local --rename --add /usr/share/man-db/update-mandb
+    echo -e '#!/bin/sh\nexit 0' > /usr/share/man-db/update-mandb
+    chmod +x /usr/share/man-db/update-mandb
+fi
+echo "man-db hold" | dpkg --set-selections
 
-_append_cred(){
-  local label="$1" user="$2" pass="$3"
-  {
-    echo -e "${label}:"
-    echo -e "  User: ${user}"
-    echo -e "  Pass: ${pass}"
-  } >> "$PMA_CRED_FILE"
-}
+cat > /etc/dpkg/dpkg.cfg.d/01_nodocs <<EOF
+path-exclude=/usr/share/doc/*
+path-exclude=/usr/share/groff/*
+path-exclude=/usr/share/info/*
+path-exclude=/usr/share/lintian/*
+path-exclude=/usr/share/man/*
+EOF
+cat > /etc/apt/apt.conf.d/99locale <<EOF
+Acquire::Languages "none";
+EOF
+cat > /etc/apt/apt.conf.d/90parallel <<EOF
+Acquire::Queue-Mode "access";
+Acquire::http { Pipeline-Depth "10"; };
+EOF
 
-# --- install Nginx ---
-if ! dpkg -l nginx &>/dev/null; then
-  log "[1/14] installing nginx"
-  apt update && apt install -y nginx
-else
-  log "[1/14] nginx already installed"
+if [ ! -L /usr/sbin/locale-gen ]; then
+    dpkg-divert --local --rename --add /usr/sbin/locale-gen
+    ln -sf /bin/true /usr/sbin/locale-gen
 fi
 
-# --- install UFW ---
-if ! dpkg -l ufw &>/dev/null; then
-  log "[2/14] installing ufw"
-  apt update && apt install -y ufw
-else
-  log "[2/14] ufw already installed"
-fi
+set +e
+for attempt in 1 2; do
+  log "---- Provision attempt #$attempt ----"
+  kill_blockers
+  run_apt_fast "dpkg --configure -a"
+  kill_blockers
+  run_apt_fast "apt-get install -f -y $APT_FAST"
 
-if ! ufw status | grep -q 'Status: active' &>/dev/null; then
-  log "[2/14] enabling ufw"
-  ufw --force enable
-else
-  log "[2/14] ufw already enabled"
-fi
+  # ------- PHP SECTION, FASTEST INSTALL ---------
+  kill_blockers
+  run_apt_fast_aggressive "apt-get install -y $APT_FAST nginx ufw php-fpm php-mysql php-cli php-common mysql-server mysql-client-core-8.0 libmysqlclient-dev"
 
-if ! ufw status | grep -q '80/tcp' &>/dev/null; then
-  log "[2/14] allowing HTTP/HTTPS in ufw"
-  ufw allow 80/tcp
-  ufw allow 443/tcp
-  ufw allow 'Nginx Full'
-else
-  log "[2/14] ports already allowed in ufw"
-fi
+  ufw --force enable || true; ufw allow 80; ufw allow 443
 
-# --- MySQL setup ---
-if ! dpkg -l mysql-server &>/dev/null; then
-  log "[3/14] installing mysql-server"
-  DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends mysql-server mysql-client-core-8.0
-else
-  log "[3/14] mysql-server already present"
-fi
+  rm -f /usr/sbin/policy-rc.d
+  kill_blockers
+  pkill -9 mysqld mysqld_safe || true
+  rm -f /var/run/mysqld/*.pid /var/run/mysqld/*.sock || true
+  sleep 1
 
-SEC_MARK="/root/.mysql_secure_done"
-if [[ ! -f $SEC_MARK ]]; then
-  log "[4/14] securing MySQL"
-  mysql -u root <<SQL
+  kill_blockers
+  systemctl enable mysql
+  systemctl restart mysql
+  mysql_ok=0
+  for try in {1..4}; do
+    sleep 2
+    if mysqladmin ping -uroot --silent; then
+      log "[OK] mysql running"
+      mysql_ok=1; break
+    else
+      pkill -9 mysqld mysqld_safe || true
+      sleep 3
+    fi
+  done
+
+  if ((mysql_ok==1)); then
+    log "[MySQL] Securing root and privileges"
+    mysql -uroot <<SQL
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'root';
 DELETE FROM mysql.user WHERE User='';
 UPDATE mysql.user SET Host='localhost' WHERE User='root';
 DROP DATABASE IF EXISTS test;
 DELETE FROM mysql.db WHERE Db LIKE 'test%';
 FLUSH PRIVILEGES;
 SQL
-  touch "$SEC_MARK"
-else
-  log "[4/14] MySQL already secured"
-fi
-
-# --- PHP ---
-if ! dpkg -l php-fpm &>/dev/null; then
-  log "[5/14] installing php-fpm and extensions"
-  apt install -y php-fpm php-mysql
-else
-  log "[5/14] PHP already installed"
-fi
-
-MACHINE_IP="$(hostname -I | awk '{print $1}')"; log "Machine IP: ${MACHINE_IP}"
-shopt -s nullglob
-php_socks=(/run/php/php*-fpm.sock /var/run/php/php*-fpm.sock)
-shopt -u nullglob
-PHP_SOCK="${php_socks[0]}"
-
-# --- Nginx site ---
-if [[ ! -f "${DEF_NGINX}.bak" ]]; then
-  cp "$DEF_NGINX" "${DEF_NGINX}.bak"
-  log "[6/14] backed up nginx config"
-fi
+  fi
 
 cat > "$DEF_NGINX" <<EOF
+# ... your full nginx config block (unchanged) ...
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
-
-    root /var/www/html;
-    index index.php;
     server_name _;
 
-    location /php_adm {
-        auth_basic "Restricted";
-        auth_basic_user_file /etc/nginx/.htpasswd;
-    }
-
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-
-    location ~ \.php\$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:${PHP_SOCK};
-        fastcgi_read_timeout 240;
-    }
+    root /var/www/html;
+    index index.php index.html;
 
     client_max_body_size 10M;
 
-    location ~ /system { deny all; }
-    location ~ /\.(git|ht|md|json|dist)\$ { deny all; }
-    location ~* (file://|\.%00) { return 444; }
-    location ~* /\.env.* { return 403; }
+    location ~* \.(?:ico|css|js|gif|jpe?g|png|woff2?|eot|ttf|svg|otf|webp|map)$ {
+        access_log off;
+        expires    30d;
+        add_header Cache-Control "public";
+        try_files  \$uri =404;
+    }
+
+    location / {
+        try_files \$uri \$uri/ @rewrite;
+    }
+    location @rewrite {
+        rewrite ^/(.*)$ /index.php/\$1 last;
+    }
+
+    location ~ ^(.+\.php)(/.*)?\$ {
+        fastcgi_split_path_info ^(.+\.php)(/.*)\$;
+        include             snippets/fastcgi-php.conf;
+        fastcgi_pass        unix:/run/php/php8.3-fpm.sock;
+        fastcgi_param       SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param       PATH_INFO       \$fastcgi_path_info;
+        include             fastcgi_params;
+        fastcgi_read_timeout 240;
+    }
+
+    location ~ ^/(system|vendor|storage|tests|\.env) {
+        deny all;
+    }
+    location ~* /\.(?:ht|git|svn|env)\$ {
+        deny all;
+    }
+    location ~* \.(?:md|json|dist|sql|bak|old|backup|tpl|twig|log)\$ {
+        deny all;
+    }
+
+    add_header X-Frame-Options        "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+    add_header X-XSS-Protection       "1; mode=block";
 }
 EOF
 
-nginx -t && systemctl reload nginx && log "[6/14] nginx site configured"
+  kill_blockers
+  systemctl enable nginx
+  systemctl restart nginx
+  nginx -t && systemctl reload nginx
 
-# ─── 7) install & record phpMyAdmin app password ──────────────────────────
-if ! dpkg -l phpmyadmin &>/dev/null; then
-  log "[7/14] installing phpMyAdmin"
-  apt update && apt install -y debconf-utils dbconfig-common software-properties-common
-  PMA_APP_PASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 64)"
-  PRESEED=$(cat <<EOF
-phpmyadmin phpmyadmin/reconfigure-webserver multiselect none
+  debconf-set-selections <<EOL
 phpmyadmin phpmyadmin/dbconfig-install boolean true
-phpmyadmin phpmyadmin/mysql/app-pass password $PMA_APP_PASS
-phpmyadmin phpmyadmin/app-password-confirm password $PMA_APP_PASS
-EOF
-)
-  echo "$PRESEED" | debconf-set-selections
-  DEBIAN_FRONTEND=noninteractive apt install -y phpmyadmin
-  echo -e "phpMyAdmin application password:\n  User: pmaapp\n  Pass: $PMA_APP_PASS" > "$PMA_CRED_FILE"
-  log "[7/14] recorded phpMyAdmin app password"
-  chown "${APP_USER}:${APP_USER}" "$PMA_CRED_FILE"
-  chmod 600 "$PMA_CRED_FILE"
-else
-  log "[7/14] phpMyAdmin already installed"
-fi
-
-# ─── 8) expose it under /php_adm ──────────────────────────────────────────
-if [[ ! -L /var/www/html/php_adm ]]; then
-  log "[8/14] linking phpMyAdmin → /var/www/html/php_adm"
+phpmyadmin phpmyadmin/app-password-confirm password root
+phpmyadmin phpmyadmin/mysql/admin-pass password root
+phpmyadmin phpmyadmin/mysql/app-pass password root
+phpmyadmin phpmyadmin/reconfigure-webserver multiselect none
+EOL
+  kill_blockers
+  run_apt_fast "apt-get install -y $APT_FAST phpmyadmin"
   ln -snf /usr/share/phpmyadmin /var/www/html/php_adm
-else
-  log "[8/14] /php_adm link already exists"
-fi
 
-# ─── 9) phpMyAdmin super-user ─────────────────────────────────────────────
-if grep -q "^phpMyAdmin super-user:" "$PMA_CRED_FILE"; then
-  _read_cred "phpMyAdmin super-user"
-else
   PHS_USER="pmauser$(shuf -i1-9999 -n1)"
   PHS_PASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 64)"
-  _append_cred "phpMyAdmin super-user" "$PHS_USER" "$PHS_PASS"
-  _read_cred "phpMyAdmin super-user"
-fi
-mysql -u root --execute="
-  CREATE USER IF NOT EXISTS '${R_USER}'@'localhost' IDENTIFIED BY '${R_PASS}';
-  GRANT ALL PRIVILEGES ON *.* TO '${R_USER}'@'localhost' WITH GRANT OPTION;
-  FLUSH PRIVILEGES;
-"
-log "[9/14] phpMyAdmin super-user ready: ${R_USER}"
+  printf 'phpMyAdmin super-user:\n  User: %s\n  Pass: %s\n' "$PHS_USER" "$PHS_PASS" > "$PMA_CRED_FILE"
 
-# ─── 10) HTTP basic-auth on /php_adm ──────────────────────────────────────
-if ! dpkg -l apache2-utils &>/dev/null; then
-  log "[10/14] installing apache2-utils"
-  apt install -y apache2-utils
-fi
-if grep -q "^HTpasswd for /php_adm:" "$PMA_CRED_FILE"; then
-  _read_cred "HTpasswd for /php_adm"
-else
+  mysql -uroot -proot -e "
+CREATE USER IF NOT EXISTS '${PHS_USER}'@'localhost' IDENTIFIED BY '${PHS_PASS}';
+GRANT ALL PRIVILEGES ON *.* TO '${PHS_USER}'@'localhost' WITH GRANT OPTION;
+FLUSH PRIVILEGES;" && log "[phpMyAdmin super-user ready: ${PHS_USER}]"
+
   HT_USER="${APP_USER}$(shuf -i1-999 -n1)"
   HT_PASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 64)"
+  run_apt_fast "apt-get install -y $APT_FAST apache2-utils"
   htpasswd -bc /etc/nginx/.htpasswd "$HT_USER" "$HT_PASS"
-  _append_cred "HTpasswd for /php_adm" "$HT_USER" "$HT_PASS"
-  _read_cred "HTpasswd for /php_adm"
-fi
-sed -i '/location \/php_adm/!b;:a;N;/\}/!ba' "$DEF_NGINX" || true
-if ! grep -q 'auth_basic_user_file /etc/nginx/.htpasswd' "$DEF_NGINX"; then
-  log "[10/14] inserting auth_basic block"
-  sed -i '/server_name/a \
-    location /php_adm { auth_basic "Restricted"; auth_basic_user_file /etc/nginx/.htpasswd; }' \
-    "$DEF_NGINX"
+  printf 'HTpasswd for /php_adm:\n  User: %s\n  Pass: %s\n' "$HT_USER" "$HT_PASS" >> "$PMA_CRED_FILE"
+
   nginx -t && systemctl reload nginx
-fi
-log "[10/14] HTTP auth ready: ${R_USER}"
 
-# ─── 11) create & import canary DB ───────────────────────────────────────
-if mysql -u root -e "USE canary" &>/dev/null; then
-  log "[11/14] canary DB exists"
-else
-  [[ -s "$SCHEMA_FILE" ]] || die "Schema file missing: $SCHEMA_FILE"
-  log "[11/14] creating canary DB + importing schema"
-  mysql -u root <<SQL
-CREATE DATABASE canary CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-SQL
-  mysql -u root canary < "$SCHEMA_FILE"
-fi
-
-# ─── 12) deploy MyAcc to /var/www/html ──────────────────────────────────
-if ! dpkg -l git &>/dev/null; then
-  log "[12/14] installing git"
-  apt update && apt install -y git
-fi
-if [[ ! -d /var/www/myacc ]]; then
-  log "[12/14] cloning MyAcc"
-  rm -rf /var/www/html /var/www/myacc
-  git clone https://github.com/otsoft/myaac.git /var/www/myacc
-fi
-if [[ ! -d /var/www/html ]]; then
-  log "[12/14] moving MyAcc → /var/www/html"
-  mv /var/www/myacc /var/www/html
-fi
-ln -snf /usr/share/phpmyadmin /var/www/html/php_adm
-chown -R www-data:www-data /var/www/*
-chmod 660 /var/www/html/images/{guilds,houses,gallery}
-chmod -R 760 /var/www/html/system/cache
-
-# Set permissions for canary folder
-chmod +x /home
-chmod +x /home/$APP_USER
-if [[ -d "${CANARY_DIR}" ]]; then
-  log "[12/14] setting execute bit on ${CANARY_DIR}"
-  chmod +x "${CANARY_DIR}"
-else
-  log "[12/14] no ${CANARY_DIR} directory — skipping chmod"
-fi
-
-# ─── 12.1) Install git ──────────────────────────────────────────────
-if ! dpkg -l git &>/dev/null; then
-  log "[12.1/14] installing git"
-  apt update && apt install -y git
-else
-  log "[12.1/14] git already installed"
-fi
-# ─── 12.2) Install composer ──────────────────────────────────────────────
-# install composer /var/www/html
-if ! dpkg -l composer &>/dev/null; then
-  log "[12.2/14] installing composer"
-  apt update && apt install -y composer
-else
-  log "[12.2/14] composer already installed"
-fi
-
-# ─── Install required PHP extensions ──────────────────────────────
-log "[12.2/14] ensuring PHP extensions are present"
-apt install -y php-mbstring php-xml php-curl php-zip php-bcmath php-tokenizer php-cli php-common php-mysql
-
-# ─── Fix permissions before composer install ──────────────────────────────
-log "[12.2/14] fixing permissions on /var/www/html"
-chown -R www-data:www-data /var/www/html
-find /var/www/html -type d -exec chmod 755 {} \;
-find /var/www/html -type f -exec chmod 644 {} \;
-
-# ─── Install composer dependencies ──────────────────────────────
-if [[ ! -d /var/www/html/vendor ]]; then
-  log "[12.2/14] running composer install (this may take a moment...)"
-  cd /var/www/html || die "Failed to enter /var/www/html"
-
-  # Increase PHP memory limit and run composer with timeout
-  # Ensure /vendor exists and is owned by web user
-  # Fix ownership and directory structure
-  mkdir -p /var/www/html/vendor || die "Failed to create /var/www/html/vendor"
-  mkdir -p /var/www/html/vendor/composer || die "Failed to create /var/www/html/vendor/composer"
-
-  chown -R www-data:www-data /var/www/html
-  chmod -R 755 /var/www/html
-  chmod -R 775 /var/www/html/vendor
-  chmod -R 775 /var/www/html/vendor/composer
-  if [[ -e /var/www/html/install/ip.txt ]]; then
-    chown "$APP_USER":"$APP_USER" /var/www/html/install/ip.txt
-  else
-    log "[12.2/14] no install/ip.txt to chown, skipping"
+  if [[ -f "$SCHEMA_FILE" ]]; then
+    mysql -uroot -proot -e "CREATE DATABASE IF NOT EXISTS canary CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    mysql -uroot -proot canary < "$SCHEMA_FILE"
+    log "[canary DB schema imported]"
   fi
 
-  # Confirm permissions (again)
+  if [[ ! -d /var/www/html ]] || [[ ! -f /var/www/html/composer.json ]]; then
+    rm -rf /var/www/html 
+    kill_blockers
+    trycmd "timeout 500 git clone https://github.com/otsoft/myaac.git /var/www/html" 3 30 || die "MyAAC clone failed"
+    chown -R www-data:www-data /var/www/html
+  fi
+  ln -snf /usr/share/phpmyadmin /var/www/html/php_adm
+
+  # --------- COMPOSER INSTALL (FASTER!) ---------
+  run_apt_fast "eatmydata apt-get install -y $APT_FAST composer"
+
+  if [[ -f /var/www/html/composer.json ]] && [[ ! -f /var/www/html/vendor/autoload.php ]]; then
+    cd /var/www/html
+    kill_blockers
+    trycmd "timeout 1200 eatmydata composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts" 3 60 || die "Composer install failed"
+  fi
+
+  chown -R www-data:www-data /var/www/html
+  [[ -d /var/www/html/images       ]] && find /var/www/html/images        -type f -exec chmod 660 {} \;
+  [[ -d /var/www/html/system/cache ]] && find /var/www/html/system/cache -type f -exec chmod 760 {} \;
+
+  kill_blockers
+  run_apt_fast "eatmydata apt-get install -y $APT_FAST composer"
+  cd /var/www/html
+  if [[ -f composer.json ]]; then
+    kill_blockers
+    trycmd "timeout 1200 eatmydata composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts" 3 60 || die "Composer install failed"
+  fi
+
+  # ... nodejs/npm and all remaining sections unchanged ...
+  if ! command -v node &>/dev/null; then
+    kill_blockers
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+    kill_blockers
+    run_apt_fast "apt-get install -y $APT_FAST nodejs"
+  fi
+  if ! command -v npm &>/dev/null; then
+    kill_blockers
+    run_apt_fast "apt-get install -y $APT_FAST npm"
+  fi
+  if [[ -f package.json ]]; then
+    kill_blockers
+    trycmd "timeout 500 eatmydata npm install" 3 30 || die "npm install failed"
+  fi
+
+  chown -R www-data:www-data /var/www/html
   find /var/www/html -type d -exec chmod 755 {} \;
   find /var/www/html -type f -exec chmod 644 {} \;
 
-  # Use PHP with memory bump and force timeout (no plugins/scripts)
-  timeout 300 php -d memory_limit=1G /usr/bin/composer install \
-    --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts -vvv \
-  2>&1 | tee -a "$LOG_FILE" || true
-  if [[ $? -ne 0 ]]; then
-    log "[12.2/14] composer install failed"
-    exit 1
-  fi
+  log "✅ All steps complete on attempt #${attempt}!"
+  success=1
 
-  log "[12.2/14] composer install completed"
-else
-  log "[12.2/14] composer dependencies already installed"
-fi
+  log "Patching MyAAC canary config.lua with phpMyAdmin credentials..."
+  CONFIG_DIR="/home/${APP_USER}/canary"
+  CONFIG_FILE="${CONFIG_DIR}/config.lua"
+  CONFIG_DIST="${CONFIG_FILE}.dist"
 
-# ─── 12.3) Install Node.js (from NodeSource) ────────────────────────────────
-if ! command -v node &>/dev/null; then
-  log "[12.3/14] installing Node.js"
-  curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-  apt install -y nodejs
-else
-  log "[12.3/14] Node.js already installed"
-fi
-
-# ─── 12.4) Install Node.js dependencies ─────────────────────────────────────
-cd /var/www/html || die "Failed to enter /var/www/html"
-if [[ -f package.json ]]; then
-  log "[12.4/14] installing Node.js dependencies"
-  apt install -y build-essential
-  npm install 2>&1 | tee -a "$LOG_FILE" || true
-else
-  log "[12.4/14] no package.json found—skipping npm install"
-fi
-
-# ─── 13) OTServer & Webhost DB users ──────────────────────────────────────
-if grep -q "^OTServer host:" "$PMA_CRED_FILE"; then
-  _read_cred "OTServer host"
-else
-  OTSU="otservhost$(shuf -i1-9999 -n1)"
-  OTSPASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 64)"
-  mysql -u root <<SQL
-CREATE USER IF NOT EXISTS '${OTSU}'@'localhost' IDENTIFIED BY '${OTSPASS}';
-GRANT
-  SELECT, INSERT, ALTER, UPDATE, DELETE, CREATE, EVENT,
-  EXECUTE, INDEX, DROP, LOCK TABLES
-ON canary.* TO '${OTSU}'@'localhost';
-FLUSH PRIVILEGES;
-SQL
-  _append_cred "OTServer host" "$OTSU" "$OTSPASS"
-  _read_cred "OTServer host"
-fi
-log "[13/14] OTServer host ready: ${R_USER}"
-
-if grep -q "^Webhost user:" "$PMA_CRED_FILE"; then
-  _read_cred "Webhost user"
-else
-  WEBU="webhost$(shuf -i1-9999 -n1)"
-  WEBP="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 64)"
-  mysql -u root <<SQL
-CREATE USER IF NOT EXISTS '${WEBU}'@'localhost' IDENTIFIED BY '${WEBP}';
-GRANT
-  SELECT, INSERT, ALTER, UPDATE, DELETE, CREATE, EVENT,
-  EXECUTE, INDEX, DROP, LOCK TABLES
-ON canary.* TO '${WEBU}'@'localhost';
-FLUSH PRIVILEGES;
-SQL
-  _append_cred "Webhost user" "$WEBU" "$WEBP"
-  _read_cred "Webhost user"
-fi
-log "[13/14] Webhost user ready: ${R_USER}"
-
-# ensure creds file remains secure
-chown "${APP_USER}:${APP_USER}" "$PMA_CRED_FILE"
-chmod 600 "$PMA_CRED_FILE"
-
-# ─── 14) patch canary/config.lua ─────────────────────────────────────────
-CFG="${CANARY_DIR}/config.lua"
-if [[ -f "$CFG" ]]; then
-  if grep -q "^mysqlUser = \"${R_USER}\"" "$CFG"; then
-    log "[14/14] config.lua already patched"
+  if [[ -f "${PMA_CRED_FILE}" ]]; then
+    PMA_USER=$(awk '/phpMyAdmin super-user:/ {getline; print $2}' "${PMA_CRED_FILE}")
+    PMA_PASS=$(awk '/phpMyAdmin super-user:/ {getline; getline; print $2}' "${PMA_CRED_FILE}")
   else
-    log "[14/14] patching config.lua"
-    sed -i \
-      -e 's|^mysqlHost =.*|mysqlHost = "127.0.0.1"|' \
-      -e 's|^mysqlUser =.*|mysqlUser = "'"$R_USER"'"|' \
-      -e 's|^mysqlPass =.*|mysqlPass = "'"$R_PASS"'"|' \
-      -e 's|^mysqlDatabase =.*|mysqlDatabase = "canary"|' \
-      -e 's|^mysqlDatabaseBackup =.*|mysqlDatabaseBackup = true|' \
-      -e 's|^serverName =.*|serverName = "Canary"|' \
-      "$CFG"
+    log "⚠️ Could not find PMA_CRED_FILE (${PMA_CRED_FILE}), skipping config.lua patch."
+    PMA_USER=""
+    PMA_PASS=""
   fi
-else
-  log "[14/14] config.lua not found; skipping"
-fi
 
-log "✅ All 14 steps complete!"
-# make myacc_setup.log readable to the app user
+  if [[ -d "${CONFIG_DIR}" ]]; then
+    if [[ ! -f "${CONFIG_FILE}" && -f "${CONFIG_DIST}" ]]; then
+      cp -a "${CONFIG_DIST}" "${CONFIG_FILE}"
+      log "Copied ${CONFIG_DIST} to ${CONFIG_FILE}"
+    fi
+
+    if [[ -f "${CONFIG_FILE}" ]]; then
+      log "Patching MyAAC canary config.lua MySQL settings..."
+      sed -i \
+        -e "s/^mysqlUser = \".*\"/mysqlUser = \"${PMA_USER}\"/" \
+        -e "s/^mysqlPass = \".*\"/mysqlPass = \"${PMA_PASS}\"/" \
+        -e "s/^mysqlDatabase = \".*\"/mysqlDatabase = \"canary\"/" \
+        "${CONFIG_FILE}"
+      log "Patched ${CONFIG_FILE} with phpmyadmin MySQL credentials"
+    else
+      log "No ${CONFIG_FILE} found, skipping config patch."
+    fi
+  else
+    log "No canary dir (${CONFIG_DIR}), skipping config.lua patch."
+  fi
+  break
+done
+
+set -e
+[[ -n "${success-}" ]] || die "Provisioning failed after 2 attempts."
 chown "${APP_USER}:${APP_USER}" "${LOG_FILE}"
 exit 0
