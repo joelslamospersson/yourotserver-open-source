@@ -235,7 +235,29 @@ SQL
   fi
 
 cat > "$DEF_NGINX" <<EOF
-# ... your full nginx config block (unchanged) ...
+# Change yourdomain.com to your actual domain name, in case of SSL setup
+# 1) Redirect all HTTP requests (any host) → HTTPS on yourdomain.com
+#server {
+#    listen 80 default_server;
+#    listen [::]:80 default_server;
+#    return 301 https://yourdomain.com\$request_uri;
+#}
+
+# 2) Catch‑all for HTTPS on 443 that doesn’t match our cert host → redirect
+#server {
+#    listen 443 ssl http2 default_server;
+#    listen [::]:443 ssl http2 default_server;
+#    server_name _;
+#
+#    ssl_certificate     /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
+#    ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
+#    include             /etc/letsencrypt/options-ssl-nginx.conf;
+#    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+#
+#    return 301 https://yourdomain.com\$request_uri;
+#}
+
+# 3) Main site block for yourdomain.com & www.yourdomain.com (HTTP on port 80)
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -244,8 +266,16 @@ server {
     root /var/www/html;
     index index.php index.html;
 
+    # SSL configuration (managed by Certbot)
+    # ssl_certificate     /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
+    # include             /etc/letsencrypt/options-ssl-nginx.conf;
+    # ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Allow larger uploads
     client_max_body_size 10M;
 
+    # Serve static assets directly with long cache
     location ~* \.(?:ico|css|js|gif|jpe?g|png|woff2?|eot|ttf|svg|otf|webp|map)$ {
         access_log off;
         expires    30d;
@@ -253,6 +283,7 @@ server {
         try_files  \$uri =404;
     }
 
+    # “Pretty URL” front controller
     location / {
         try_files \$uri \$uri/ @rewrite;
     }
@@ -260,6 +291,7 @@ server {
         rewrite ^/(.*)$ /index.php/\$1 last;
     }
 
+    # PHP execution (with PATH_INFO)
     location ~ ^(.+\.php)(/.*)?\$ {
         fastcgi_split_path_info ^(.+\.php)(/.*)\$;
         include             snippets/fastcgi-php.conf;
@@ -270,16 +302,22 @@ server {
         fastcgi_read_timeout 240;
     }
 
+    # Deny access to internal/system folders
     location ~ ^/(system|vendor|storage|tests|\.env) {
         deny all;
     }
+
+    # Deny dotfiles and version control
     location ~* /\.(?:ht|git|svn|env)\$ {
         deny all;
     }
+
+    # Deny backups, docs, dumps, etc.
     location ~* \.(?:md|json|dist|sql|bak|old|backup|tpl|twig|log)\$ {
         deny all;
     }
 
+    # Additional security headers
     add_header X-Frame-Options        "SAMEORIGIN";
     add_header X-Content-Type-Options "nosniff";
     add_header X-XSS-Protection       "1; mode=block";
