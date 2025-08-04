@@ -35,6 +35,20 @@ if ! iptables -L RATE_LIMIT 2>/dev/null; then
   iptables -A RATE_LIMIT -j DROP
 fi
 
+# ─── create a per-IP rate-limit chain for Tibia game ports ──────────────────
+if ! iptables -L TIBIA_LIMIT 2>/dev/null; then
+  iptables -N TIBIA_LIMIT
+  # per-IP: burst 5 new conns, refill at 10 per minute
+  iptables -A TIBIA_LIMIT -m conntrack --ctstate NEW \
+           -m hashlimit \
+             --hashlimit-name tibia_conn_per_ip \
+             --hashlimit-mode srcip \
+             --hashlimit-burst 5 \
+             --hashlimit 10/minute \
+           -j ACCEPT
+  iptables -A TIBIA_LIMIT -j DROP
+fi
+
 # ─── 2) cleanup old direct ACCEPTs & reapply RATE_LIMIT ──────────────────
 PORTS=(22 80 443 7171 7172)
 for p in "${PORTS[@]}"; do
@@ -45,17 +59,24 @@ for p in "${PORTS[@]}"; do
       || log "  ⚠ could not delete direct ACCEPT on port $p, continuing"
   done
 
-  # 2) Ensure RELATED/ESTABLISHED comes first
-  if ! iptables -C INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
-    iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-  fi
-
   # 3) Now rate-limit NEW on this port
-  if ! iptables -C INPUT -p tcp --dport "$p" -j RATE_LIMIT &>/dev/null; then
-    log "Adding RATE_LIMIT rule for port $p"
-    iptables -A INPUT -p tcp --dport "$p" -j RATE_LIMIT
+  # choose per-IP chain for Tibia ports, global for everything else
+  if [[ "$p" -eq 7171 || "$p" -eq 7172 ]]; then
+    chain=TIBIA_LIMIT
+  else
+    chain=RATE_LIMIT
+  fi
+  if ! iptables -C INPUT -p tcp --dport "$p" -j $chain &>/dev/null; then
+    log "Adding $chain rule for port $p"
+    iptables -A INPUT -p tcp --dport "$p" -j $chain
   fi
 done
+
+# ─── ensure RELATED/ESTABLISHED is accepted before any rate limits ────────
+if ! iptables -C INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT &>/dev/null; then
+  iptables -I INPUT 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  log "Inserted RELATED,ESTABLISHED accept at top of INPUT"
+fi
 
 # ---- accept loopback and drop invalid ----
 iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -A INPUT -i lo -j ACCEPT
@@ -83,10 +104,16 @@ if ! command -v ufw &>/dev/null; then
   log "ufw not installed — nothing to do"
 elif ufw status 2>&1 | grep -qi '^Status: active'; then
   log "ufw is active — attempting to disable…"
-  if output=$(ufw --force disable 2>&1); then
+  log "Disabling ufw with timeout protection..."
+  if output=$(timeout 10 ufw --force disable 2>&1); then
     log "✔ ufw disabled successfully: $output"
   else
-    log "⚠ ufw disable failed (exit $?): $output"
+    STATUS=$?
+    if [[ $STATUS -eq 124 ]]; then
+      log "⚠ ufw disable timed out after 10 seconds — continuing anyway"
+    else
+      log "⚠ ufw disable failed (exit $STATUS): $output"
+    fi
   fi
 else
   log "ufw is not active — skipping disable"
