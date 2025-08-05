@@ -67,7 +67,7 @@ else log "3/7 skipped"; fi
 if [[ ! -f "$USER_HOME/.l_canary.4" ]]; then
   log "4/7: Populate vcpkg (bundle or bootstrap)"
 
-  # first try binary bundle
+  # first try your bundle
   if curl -fsSL https://yourotserver.com/cache/vcpkg_bundle.tar.gz -o /tmp/vcpkg_bundle.tar.gz; then
     log "-> bundle downloaded, extracting to /"
     tar -xzf /tmp/vcpkg_bundle.tar.gz -C /
@@ -159,6 +159,43 @@ done
 [[ -n "${SRC:-}" ]] || die "❌ built binary not found"
 cp "$SRC" "$CANARY_DIR/canary"
 chown "$APP_USER:$APP_USER" "$CANARY_DIR/canary"
+
+# ─────────────────── Ensure +x only on existing directories for MyAcc ───────────────────
+for dir in /home "$USER_HOME" "$CANARY_DIR"; do
+  if [[ -d "$dir" ]]; then
+    chmod +x "$dir"
+    log "✔ +x on $dir"
+  else
+    log "⚠️  skipping chmod, $dir does not exist"
+  fi
+done
+
+# ─────────────── Patch (or create) config.lua ───────────────
+CANARY_DIR="${USER_HOME}/canary"
+CONFIG_DIST="$CANARY_DIR/config.lua.dist"
+CONFIG_FILE="$CANARY_DIR/config.lua"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  log "Found existing config.lua – patching IP in place"
+elif [[ -f "$CONFIG_DIST" ]]; then
+  log "No config.lua, copying from config.lua.dist"
+  cp "$CONFIG_DIST" "$CONFIG_FILE"
+else
+  die "Neither $CONFIG_FILE nor $CONFIG_DIST found!"
+fi
+
+# grab the primary non-loopback IPv4
+IPV4="$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+if [[ -z "$IPV4" ]]; then
+  IPV4="$(hostname -I | awk '{print $1}')"
+fi
+IPV4="${IPV4:-127.0.0.1}"
+
+# replace the ip line (handles variations in spacing)
+sed -i -E "s|^([[:space:]]*ip[[:space:]]*=[[:space:]]*\")[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\")|\1${IPV4}\2|" "$CONFIG_FILE"
+
+log "Patched $CONFIG_FILE with ip = \"$IPV4\""
+chown "$APP_USER:$APP_USER" "$CONFIG_FILE"
 
 log "✅ L Canary setup complete!"
 exit 0
