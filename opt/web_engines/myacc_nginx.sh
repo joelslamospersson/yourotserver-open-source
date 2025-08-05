@@ -340,20 +340,37 @@ EOL
   run_apt_fast "apt-get install -y $APT_FAST phpmyadmin"
   ln -snf /usr/share/phpmyadmin /var/www/html/php_adm
 
-  PHS_USER="pmauser$(shuf -i1-9999 -n1)"
-  PHS_PASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 64)"
-  printf 'phpMyAdmin super-user:\n  User: %s\n  Pass: %s\n' "$PHS_USER" "$PHS_PASS" > "$PMA_CRED_FILE"
+# ─── phpMyAdmin super-user + reuse for canary/myacc ─────────────────────────
 
-  mysql -uroot -proot -e "
+# 1) Generate a phpMyAdmin super-user with a random 32-char password (!, #, letters, digits)
+PHS_USER="pmauser$(shuf -i1-9999 -n1)"
+PHS_PASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9!#' | head -c 32)"
+
+# 2) Recreate the credentials file and lock it down
+: > "$PMA_CRED_FILE"
+chmod 600 "$PMA_CRED_FILE"
+printf 'phpMyAdmin super-user:\n  User: %s\n  Pass: %s\n\n' \
+  "$PHS_USER" "$PHS_PASS" >> "$PMA_CRED_FILE"
+
+# 3) Create the user and grant global rights ( so phpMyAdmin can manage anything )
+mysql -uroot -proot <<SQL
 CREATE USER IF NOT EXISTS '${PHS_USER}'@'localhost' IDENTIFIED BY '${PHS_PASS}';
 GRANT ALL PRIVILEGES ON *.* TO '${PHS_USER}'@'localhost' WITH GRANT OPTION;
-FLUSH PRIVILEGES;" && log "[phpMyAdmin super-user ready: ${PHS_USER}]"
+FLUSH PRIVILEGES;
+SQL
+log "[phpMyAdmin super-user ready: ${PHS_USER}]"
 
-  HT_USER="${APP_USER}$(shuf -i1-999 -n1)"
-  HT_PASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 64)"
-  run_apt_fast "apt-get install -y $APT_FAST apache2-utils"
-  htpasswd -bc /etc/nginx/.htpasswd "$HT_USER" "$HT_PASS"
-  printf 'HTpasswd for /php_adm:\n  User: %s\n  Pass: %s\n' "$HT_USER" "$HT_PASS" >> "$PMA_CRED_FILE"
+# 4) Now restrict that same account to only your canary & myacc schemas
+mysql -uroot -proot <<SQL
+GRANT ALL PRIVILEGES ON canary.* TO '${PHS_USER}'@'localhost';
+GRANT ALL PRIVILEGES ON myacc.*   TO '${PHS_USER}'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+log "[canary & myacc privileges granted to ${PHS_USER}]"
+
+# 5) Append a note about those schema-specific grants for easy reference
+printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
+  "$PHS_USER" "$PHS_PASS" >> "$PMA_CRED_FILE"
 
   nginx -t && systemctl reload nginx
 
@@ -392,7 +409,7 @@ FLUSH PRIVILEGES;" && log "[phpMyAdmin super-user ready: ${PHS_USER}]"
     trycmd "timeout 1200 eatmydata composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts" 3 60 || die "Composer install failed"
   fi
 
-  # ... nodejs/npm and all remaining sections unchanged ...
+  # ─────────────────────────── 4/7: Vcpkg & manifest-mode ──────────────────────────────
   if ! command -v node &>/dev/null; then
     kill_blockers
     curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
@@ -412,8 +429,40 @@ FLUSH PRIVILEGES;" && log "[phpMyAdmin super-user ready: ${PHS_USER}]"
   find /var/www/html -type d -exec chmod 755 {} \;
   find /var/www/html -type f -exec chmod 644 {} \;
 
+  # Find the first php*-fpm.sock ( e.g. php8.3-fpm.sock )
+  phpfpm_sock=$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n1)
+  if [ -n "$phpfpm_sock" ]; then
+    # Strip “.sock” to get “php8.3-fpm” ( or whatever version is installed )
+    phpfpm_service=$(basename "$phpfpm_sock" .sock)
+    log "Re-starting $phpfpm_service service"
+    systemctl enable "$phpfpm_service"
+    systemctl start  "$phpfpm_service"
+  else
+    log "⚠️  No php-fpm socket found under /run/php/, skipping PHP-FPM restart"
+  fi
+
   log "✅ All steps complete on attempt #${attempt}!"
   success=1
+
+  # ─────── install GD & ZIP extensions, required for MyAcc plugins ───────
+  log "Installing PHP GD & ZIP extensions"
+  run_apt_fast "apt-get install -y $APT_FAST php-gd php-zip"
+
+  # reload FPM so it picks up the new modules
+  php_fpm_svc=$(basename "$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n1)" .sock)
+  if systemctl is-enabled "$php_fpm_svc" &>/dev/null; then
+    log "Restarting $php_fpm_svc to load new PHP extensions"
+    systemctl restart "$php_fpm_svc"
+  fi
+
+  # ─────── Ensure install/ip.txt is owned by the app user ───────
+  IP_FILE="/var/www/html/install/ip.txt"
+  if [[ -f "$IP_FILE" ]]; then
+    chown "${APP_USER}:${APP_USER}" "$IP_FILE"
+    log "✅ Ownership of $IP_FILE set to ${APP_USER}:${APP_USER}"
+  else
+    log "⚠️  $IP_FILE not found, skipping ownership change"
+  fi
 
   log "Patching MyAAC canary config.lua with phpMyAdmin credentials..."
   CONFIG_DIR="/home/${APP_USER}/canary"
