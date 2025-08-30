@@ -6,8 +6,28 @@ APP_USER="${1:-${SUDO_USER:-$(id -un)}}"
 USER_HOME="/home/${APP_USER}"
 LOG_FILE="${USER_HOME}/myacc_setup.log"
 PMA_CRED_FILE="${USER_HOME}/phpmyadmin.txt"
-CANARY_DIR="${USER_HOME}/canary"
-SCHEMA_FILE="${CANARY_DIR}/schema.sql"
+# Engine autodetect: support ~/tfs or /root/tfs, and ~/canary or /root/canary
+# TFS requires passwordType = "sha1" in config.lua for proper password hashing
+TFS_DIR_USER="${USER_HOME}/tfs"
+CANARY_DIR_USER="${USER_HOME}/canary"
+TFS_DIR_ROOT="/root/tfs"
+CANARY_DIR_ROOT="/root/canary"
+
+if [[ -d "$TFS_DIR_USER" ]]; then
+  ENGINE_DIR="$TFS_DIR_USER"
+elif [[ -d "$TFS_DIR_ROOT" ]]; then
+  ENGINE_DIR="$TFS_DIR_ROOT"
+elif [[ -d "$CANARY_DIR_USER" ]]; then
+  ENGINE_DIR="$CANARY_DIR_USER"
+elif [[ -d "$CANARY_DIR_ROOT" ]]; then
+  ENGINE_DIR="$CANARY_DIR_ROOT"
+else
+  # default to user-canary path if neither exists yet (first-time run)
+  ENGINE_DIR="$CANARY_DIR_USER"
+fi
+ENGINE_NAME="$(basename "$ENGINE_DIR")"   # "tfs" or "canary"
+DB_NAME="$ENGINE_NAME"
+SCHEMA_FILE="${ENGINE_DIR}/schema.sql"
 DEF_NGINX="/etc/nginx/sites-available/default"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -17,6 +37,13 @@ export COMPOSER_HOME=/root/.config/composer
 
 log(){ echo -e "\n>>> $*" | tee -a "${LOG_FILE}"; }
 die(){ echo -e "\n✖ $*" | tee -a "${LOG_FILE}"; exit 1; }
+
+# Optional acceleration with eatmydata (fallback to no-op if missing)
+if command -v eatmydata >/dev/null 2>&1; then
+  EAT="eatmydata"
+else
+  EAT=""
+fi
 
 find_blockers() {
     ps -eo pid,ppid,comm,args | grep -E 'apt(-get)?|dpkg|unattended-upgrade|mandb|update-mandb|update-mime' | grep -vE "grep|$$" | awk '{print $1}'
@@ -68,7 +95,7 @@ run_apt_fast_aggressive(){
   kill_blockers_safe
   log "→ $cmd (timeout ${tmo}s, aggressive lock killer)"
 
-  timeout $tmo eatmydata bash -c "$cmd" &
+  timeout $tmo bash -c "$EAT $cmd" &
   main_pid=$!
 
   while kill -0 $main_pid 2>/dev/null; do
@@ -116,7 +143,7 @@ run_apt_fast(){
     wait_for_dpkg_lock
     kill_blockers
     log "→ $cmd (timeout ${tmo}s, try #$attempt)"
-    timeout $tmo eatmydata bash -c "$cmd"
+    timeout $tmo bash -c "$EAT $cmd"
     rc=$?
     if (( rc == 0 )); then
       log "[OK] $cmd"
@@ -362,11 +389,11 @@ log "[phpMyAdmin super-user ready: ${PHS_USER}]"
 
 # 4) Now restrict that same account to only your canary & myacc schemas
 mysql -uroot -proot <<SQL
-GRANT ALL PRIVILEGES ON canary.* TO '${PHS_USER}'@'localhost';
-GRANT ALL PRIVILEGES ON myacc.*   TO '${PHS_USER}'@'localhost';
+GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${PHS_USER}'@'localhost';
+GRANT ALL PRIVILEGES ON myacc.*    TO '${PHS_USER}'@'localhost';
 FLUSH PRIVILEGES;
 SQL
-log "[canary & myacc privileges granted to ${PHS_USER}]"
+log "[${DB_NAME} & myacc privileges granted to ${PHS_USER}]"
 
 # 5) Append a note about those schema-specific grants for easy reference
 printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
@@ -375,9 +402,9 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
   nginx -t && systemctl reload nginx
 
   if [[ -f "$SCHEMA_FILE" ]]; then
-    mysql -uroot -proot -e "CREATE DATABASE IF NOT EXISTS canary CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-    mysql -uroot -proot canary < "$SCHEMA_FILE"
-    log "[canary DB schema imported]"
+    mysql -uroot -proot -e "CREATE DATABASE IF NOT EXISTS ${DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    mysql -uroot -proot ${DB_NAME} < "$SCHEMA_FILE"
+    log "[${DB_NAME} DB schema imported]"
   fi
 
   if [[ ! -d /var/www/html ]] || [[ ! -f /var/www/html/composer.json ]]; then
@@ -389,12 +416,12 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
   ln -snf /usr/share/phpmyadmin /var/www/html/php_adm
 
   # --------- COMPOSER INSTALL (FASTER!) ---------
-  run_apt_fast "eatmydata apt-get install -y $APT_FAST composer"
+  run_apt_fast "apt-get install -y $APT_FAST composer"
 
   if [[ -f /var/www/html/composer.json ]] && [[ ! -f /var/www/html/vendor/autoload.php ]]; then
     cd /var/www/html
     kill_blockers
-    trycmd "timeout 1200 eatmydata composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts" 3 60 || die "Composer install failed"
+    trycmd "timeout 1200 $EAT composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts" 3 60 || die "Composer install failed"
   fi
 
   chown -R www-data:www-data /var/www/html
@@ -402,11 +429,11 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
   [[ -d /var/www/html/system/cache ]] && find /var/www/html/system/cache -type f -exec chmod 760 {} \;
 
   kill_blockers
-  run_apt_fast "eatmydata apt-get install -y $APT_FAST composer"
+  run_apt_fast "apt-get install -y $APT_FAST composer"
   cd /var/www/html
   if [[ -f composer.json ]]; then
     kill_blockers
-    trycmd "timeout 1200 eatmydata composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts" 3 60 || die "Composer install failed"
+    trycmd "timeout 1200 $EAT composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts" 3 60 || die "Composer install failed"
   fi
 
   # ─────────────────────────── 4/7: Vcpkg & manifest-mode ──────────────────────────────
@@ -422,7 +449,7 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
   fi
   if [[ -f package.json ]]; then
     kill_blockers
-    trycmd "timeout 500 eatmydata npm install" 3 30 || die "npm install failed"
+    trycmd "timeout 500 $EAT npm install" 3 30 || die "npm install failed"
   fi
 
   chown -R www-data:www-data /var/www/html
@@ -464,8 +491,8 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
     log "⚠️  $IP_FILE not found, skipping ownership change"
   fi
 
-  log "Patching MyAAC canary config.lua with phpMyAdmin credentials..."
-  CONFIG_DIR="/home/${APP_USER}/canary"
+  log "Patching MyAAC ${ENGINE_NAME} config.lua with phpMyAdmin credentials..."
+  CONFIG_DIR="${ENGINE_DIR}"
   CONFIG_FILE="${CONFIG_DIR}/config.lua"
   CONFIG_DIST="${CONFIG_FILE}.dist"
 
@@ -485,18 +512,31 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
     fi
 
     if [[ -f "${CONFIG_FILE}" ]]; then
-      log "Patching MyAAC canary config.lua MySQL settings..."
+      log "Patching MyAAC ${ENGINE_NAME} config.lua MySQL settings..."
       sed -i \
         -e "s/^mysqlUser = \".*\"/mysqlUser = \"${PMA_USER}\"/" \
         -e "s/^mysqlPass = \".*\"/mysqlPass = \"${PMA_PASS}\"/" \
-        -e "s/^mysqlDatabase = \".*\"/mysqlDatabase = \"canary\"/" \
+        -e "s/^mysqlDatabase = \".*\"/mysqlDatabase = \"${DB_NAME}\"/" \
         "${CONFIG_FILE}"
+      
+      # Add passwordType = "sha1" for TFS
+      if [[ "${ENGINE_NAME}" == "tfs" ]]; then
+        # Check if passwordType already exists
+        if ! grep -q "^passwordType" "${CONFIG_FILE}"; then
+          # Add passwordType after mysqlSock line
+          sed -i '/^mysqlSock = ".*"/a passwordType = "sha1"' "${CONFIG_FILE}"
+          log "Added passwordType = \"sha1\" to TFS config.lua"
+        else
+          log "passwordType already exists in TFS config.lua"
+        fi
+      fi
+      
       log "Patched ${CONFIG_FILE} with phpmyadmin MySQL credentials"
     else
       log "No ${CONFIG_FILE} found, skipping config patch."
     fi
   else
-    log "No canary dir (${CONFIG_DIR}), skipping config.lua patch."
+    log "No ${ENGINE_NAME} dir (${CONFIG_DIR}), skipping config.lua patch."
   fi
   break
 done
