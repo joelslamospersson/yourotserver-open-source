@@ -88,11 +88,11 @@ ipt_add INPUT -p tcp --dport 7172 -m $CONNTRACK_MODULE NEW -m hashlimit \
   --hashlimit-mode srcip --hashlimit-htable-expire 300000 -j DROP
 
 ipt_add INPUT -p tcp --dport 80 -m $CONNTRACK_MODULE NEW -m hashlimit \
-  --hashlimit-name http80 --hashlimit-above 30/10s --hashlimit-burst 40 \
+  --hashlimit-name http80 --hashlimit-above 120/10s --hashlimit-burst 200 \
   --hashlimit-mode srcip --hashlimit-htable-expire 300000 -j DROP
 
 ipt_add INPUT -p tcp --dport 443 -m $CONNTRACK_MODULE NEW -m hashlimit \
-  --hashlimit-name https443 --hashlimit-above 30/10s --hashlimit-burst 40 \
+  --hashlimit-name https443 --hashlimit-above 120/10s --hashlimit-burst 200 \
   --hashlimit-mode srcip --hashlimit-htable-expire 300000 -j DROP
 
 ipt_add INPUT -p tcp --dport 22 -m $CONNTRACK_MODULE NEW -m hashlimit \
@@ -107,7 +107,13 @@ else
   log "→ iptables hashlimit configured (netfilter-persistent not available)"
 fi
 
-# 1b) Ensure SSH port is always reachable (handles custom ports)
+# 1b) Ensure loopback always allowed + SSH/HTTP reachable (handles custom ports)
+# Always allow loopback early
+if ! iptables -C INPUT -i lo -j ACCEPT >/dev/null 2>&1; then
+  iptables -I INPUT 1 -i lo -j ACCEPT || true
+fi
+
+# 1c) Ensure SSH port is always reachable (handles custom ports)
 # Detect active SSH port from config; default to 22
 SSH_PORT="$(awk '/^\s*Port\s+/ {print $2}' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | tail -n1)"
 [[ -z "$SSH_PORT" ]] && SSH_PORT=22
@@ -136,6 +142,18 @@ fi
 if command -v netfilter-persistent >/dev/null 2>&1; then
   netfilter-persistent save >/dev/null 2>&1 || true
 fi
+
+# 1d) Early ACCEPT for HTTP/HTTPS to avoid legacy UFW chains blocking
+for PORT in 80 443; do
+  if ! iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
+    iptables -I INPUT 2 -p tcp --dport "$PORT" -j ACCEPT || true
+  fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    if ! ip6tables -C INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1; then
+      ip6tables -I INPUT 2 -p tcp --dport "$PORT" -j ACCEPT || true
+    fi
+  fi
+done
 
 # 2) Detect access log (nginx/apache)
 if [[ -f /var/log/nginx/access.log ]]; then
