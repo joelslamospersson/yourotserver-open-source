@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -o errtrace
 
 # ────────────────────────── Config ──────────────────────────
 # Build TFS 7.72 using vcpkg-based workflow
@@ -11,10 +12,28 @@ SRC_DIR_NAME="TFS-1.5-Downgrades-7.72"   # how the zip extracts
 log(){ echo -e "\n>>> $*"; }
 die(){ echo -e "\nERROR: $*" >&2; exit 1; }
 
+# Error trap to print failing command, line and useful build logs
+on_error(){
+  local exit_code=$?
+  echo -e "\n✖ Failure (exit ${exit_code}) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"
+  if [[ -n "${TFS_DIR:-}" ]] && [[ -d "$TFS_DIR/build" ]]; then
+    [[ -f "$TFS_DIR/build/CMakeFiles/CMakeError.log"  ]] && { echo "--- tail CMakeError.log ---";  tail -n 80 "$TFS_DIR/build/CMakeFiles/CMakeError.log"; }
+    [[ -f "$TFS_DIR/build/CMakeFiles/CMakeOutput.log" ]] && { echo "--- tail CMakeOutput.log ---"; tail -n 40 "$TFS_DIR/build/CMakeFiles/CMakeOutput.log"; }
+    # Any other logs under build
+    find "$TFS_DIR/build" -maxdepth 2 -type f -name '*.log' -print -exec tail -n 50 {} \; 2>/dev/null || true
+  fi
+}
+trap on_error ERR
+
 # Pick the real user even if running via sudo
 APP_USER="${SUDO_USER:-$USER}"
 APP_HOME="$(getent passwd "$APP_USER" | cut -d: -f6)"
 TFS_DIR="$APP_HOME/tfs"
+
+# Mirror all output to a logfile while keeping console output
+LOG_FILE="${APP_HOME:-${HOME:-/root}}/nekiro_setup_772.log"
+{ : >"$LOG_FILE"; } 2>/dev/null || true
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 # ────────────────────────── Pre-flight ──────────────────────
 log "Updating apt and installing required packages…"
