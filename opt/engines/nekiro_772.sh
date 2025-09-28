@@ -92,6 +92,8 @@ chown -R "$APP_USER:$APP_USER" "$TFS_DIR"
 
 # ────────────────────────── Source compatibility (Boost.Asio) ────────────────
 # Adapt older Nekiro 7.72 sources to newer Boost.Asio APIs
+# Old code goes BRRRRRRRRRRRRRRRRRR
+# I love ai, this is a mess of code but works ty
 log "Patching sources for Boost.Asio compatibility…"
 (
   cd "$TFS_DIR"
@@ -240,6 +242,7 @@ log "Setting up config.lua…"
 cd "$TFS_DIR"
 
 # ─────────────── Patch (or create) config.lua ───────────────────────────────
+# Database credentials are left out for myacc setup
 CONFIG_DIST="$TFS_DIR/config.lua.dist"
 CONFIG_FILE="$TFS_DIR/config.lua"
 
