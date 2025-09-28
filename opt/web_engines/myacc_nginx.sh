@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
-trap 'die "Error on or near line ${LINENO}. See ${LOG_FILE}."' ERR
 
+# Get basic variables first
 APP_USER="${1:-${SUDO_USER:-$(id -un)}}"
 USER_HOME="/home/${APP_USER}"
 LOG_FILE="${USER_HOME}/myacc_setup.log"
 PMA_CRED_FILE="${USER_HOME}/phpmyadmin.txt"
+
+# Define functions immediately after variables
+log(){ echo -e "\n>>> $*" | tee -a "${LOG_FILE}"; }
+die(){ echo -e "\n✖ $*" | tee -a "${LOG_FILE}"; exit 1; }
+
+# Set up error trap now that die function is defined
+trap 'die "Error on or near line ${LINENO}. See ${LOG_FILE}."' ERR
+
+# Generate secure 32-character MySQL root password
+MYSQL_ROOT_PASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9!#' | head -c 32 | tr -d ' ')"
 # Engine autodetect: support ~/tfs or /root/tfs, and ~/canary or /root/canary
 # TFS requires passwordType = "sha1" in config.lua for proper password hashing
 TFS_DIR_USER="${USER_HOME}/tfs"
@@ -27,7 +37,32 @@ else
 fi
 ENGINE_NAME="$(basename "$ENGINE_DIR")"   # "tfs" or "canary"
 DB_NAME="$ENGINE_NAME"
-SCHEMA_FILE="${ENGINE_DIR}/schema.sql"
+
+# Set executable permissions for MyAcc to access engine directories
+log "Setting executable permissions for MyAcc access to engine directories..."
+chmod +x /home
+if [[ -d "$USER_HOME" ]]; then
+  chmod +x "$USER_HOME"
+  log "Set executable permission on $USER_HOME"
+fi
+if [[ -d "$ENGINE_DIR" ]]; then
+  chmod +x "$ENGINE_DIR"
+  log "Set executable permission on $ENGINE_DIR"
+fi
+# Also set permissions on /root if engine is there
+if [[ "$ENGINE_DIR" == "/root/"* ]]; then
+  chmod +x /root
+  log "Set executable permission on /root"
+fi
+
+# Handle special case for Nostalrius (uses nostalrius.sql instead of schema.sql)
+# Too lazy to rename the file, req unzip and zip
+if [[ "$ENGINE_NAME" == "tfs" ]] && [[ -f "${ENGINE_DIR}/nostalrius.sql" ]]; then
+  SCHEMA_FILE="${ENGINE_DIR}/nostalrius.sql"
+  log "Using nostalrius.sql for TFS database schema"
+else
+  SCHEMA_FILE="${ENGINE_DIR}/schema.sql"
+fi
 DEF_NGINX="/etc/nginx/sites-available/default"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -35,10 +70,7 @@ export NEEDRESTART_MODE=a
 export COMPOSER_ALLOW_SUPERUSER=1
 export COMPOSER_HOME=/root/.config/composer
 
-log(){ echo -e "\n>>> $*" | tee -a "${LOG_FILE}"; }
-die(){ echo -e "\n✖ $*" | tee -a "${LOG_FILE}"; exit 1; }
-
-# Optional acceleration with eatmydata (fallback to no-op if missing)
+# acceleration with eatmydata (fallback to no-op if missing)
 if command -v eatmydata >/dev/null 2>&1; then
   EAT="eatmydata"
 else
@@ -119,6 +151,8 @@ run_apt_fast_aggressive(){
   fi
 }
 
+# Lock to avoid conflicts with other processes
+# Fucking hell, this is the most annoying thing ever
 wait_for_dpkg_lock(){
   local sec=0
   while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
@@ -130,6 +164,7 @@ wait_for_dpkg_lock(){
   done
 }
 
+# Speedy boy
 run_apt_fast(){
   local tmo=600
   local cmd
@@ -224,7 +259,8 @@ for attempt in 1 2; do
 
   # ------- PHP SECTION, FASTEST INSTALL ---------
   kill_blockers
-  run_apt_fast_aggressive "apt-get install -y $APT_FAST nginx ufw php-fpm php-mysql php-cli php-common mysql-server mysql-client-core-8.0 libmysqlclient-dev"
+  # Install all web stack components in one command for speed
+  run_apt_fast_aggressive "apt-get install -y $APT_FAST nginx ufw php-fpm php-mysql php-cli php-common php-gd php-zip mysql-server mysql-client-core-8.0 libmysqlclient-dev composer nodejs npm"
 
   ufw --force enable || true; ufw allow 80; ufw allow 443
 
@@ -252,7 +288,7 @@ for attempt in 1 2; do
   if ((mysql_ok==1)); then
     log "[MySQL] Securing root and privileges"
     mysql -uroot <<SQL
-ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'root';
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASS}';
 DELETE FROM mysql.user WHERE User='';
 UPDATE mysql.user SET Host='localhost' WHERE User='root';
 DROP DATABASE IF EXISTS test;
@@ -261,6 +297,8 @@ FLUSH PRIVILEGES;
 SQL
   fi
 
+# Place holder for SSL setup, will be replaced by letsencrypt.sh
+# If not, user can do this manually after the install
 cat > "$DEF_NGINX" <<EOF
 # Change yourdomain.com to your actual domain name, in case of SSL setup
 # 1) Redirect all HTTP requests (any host) → HTTPS on yourdomain.com
@@ -358,9 +396,9 @@ EOF
 
   debconf-set-selections <<EOL
 phpmyadmin phpmyadmin/dbconfig-install boolean true
-phpmyadmin phpmyadmin/app-password-confirm password root
-phpmyadmin phpmyadmin/mysql/admin-pass password root
-phpmyadmin phpmyadmin/mysql/app-pass password root
+phpmyadmin phpmyadmin/app-password-confirm password ${MYSQL_ROOT_PASS}
+phpmyadmin phpmyadmin/mysql/admin-pass password ${MYSQL_ROOT_PASS}
+phpmyadmin phpmyadmin/mysql/app-pass password ${MYSQL_ROOT_PASS}
 phpmyadmin phpmyadmin/reconfigure-webserver multiselect none
 EOL
   kill_blockers
@@ -371,16 +409,25 @@ EOL
 
 # 1) Generate a phpMyAdmin super-user with a random 32-char password (!, #, letters, digits)
 PHS_USER="pmauser$(shuf -i1-9999 -n1)"
-PHS_PASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9!#' | head -c 32)"
+PHS_PASS="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9!#' | head -c 32 | tr -d ' ')"
 
 # 2) Recreate the credentials file and lock it down
 : > "$PMA_CRED_FILE"
 chmod 600 "$PMA_CRED_FILE"
-printf 'phpMyAdmin super-user:\n  User: %s\n  Pass: %s\n\n' \
-  "$PHS_USER" "$PHS_PASS" >> "$PMA_CRED_FILE"
+chown "${APP_USER}:${APP_USER}" "$PMA_CRED_FILE"
+
+# Add MySQL root credentials with description
+printf 'MySQL Root User (Full Database Access):\n  User: root\n  Pass: %s\n  Description: Main MySQL administrator account with full privileges\n\n' "${MYSQL_ROOT_PASS// /}" >> "$PMA_CRED_FILE"
+
+# Add phpMyAdmin application credentials with description
+printf 'phpMyAdmin Application User:\n  User: pmaapp\n  Pass: %s\n  Description: phpMyAdmin internal application user for database management\n\n' "${MYSQL_ROOT_PASS// /}" >> "$PMA_CRED_FILE"
+
+# Add phpMyAdmin super-user credentials with description
+printf 'phpMyAdmin Super-User (Web Interface Access):\n  User: %s\n  Pass: %s\n  Description: phpMyAdmin web interface super-user with global database privileges\n\n' \
+  "$PHS_USER" "${PHS_PASS// /}" >> "$PMA_CRED_FILE"
 
 # 3) Create the user and grant global rights ( so phpMyAdmin can manage anything )
-mysql -uroot -proot <<SQL
+mysql -uroot -p${MYSQL_ROOT_PASS} <<SQL
 CREATE USER IF NOT EXISTS '${PHS_USER}'@'localhost' IDENTIFIED BY '${PHS_PASS}';
 GRANT ALL PRIVILEGES ON *.* TO '${PHS_USER}'@'localhost' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
@@ -388,7 +435,7 @@ SQL
 log "[phpMyAdmin super-user ready: ${PHS_USER}]"
 
 # 4) Now restrict that same account to only your canary & myacc schemas
-mysql -uroot -proot <<SQL
+mysql -uroot -p${MYSQL_ROOT_PASS} <<SQL
 GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${PHS_USER}'@'localhost';
 GRANT ALL PRIVILEGES ON myacc.*    TO '${PHS_USER}'@'localhost';
 FLUSH PRIVILEGES;
@@ -396,15 +443,23 @@ SQL
 log "[${DB_NAME} & myacc privileges granted to ${PHS_USER}]"
 
 # 5) Append a note about those schema-specific grants for easy reference
-printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
-  "$PHS_USER" "$PHS_PASS" >> "$PMA_CRED_FILE"
+printf 'Special Database User (Canary/MyAcc Security):\n  User: %s\n  Pass: %s\n  Description: Special user with restricted access to %s and myacc databases only for enhanced security\n  Note: This user has been granted specific privileges to tighten database security\n' \
+  "$PHS_USER" "${PHS_PASS// /}" "$DB_NAME" >> "$PMA_CRED_FILE"
 
   nginx -t && systemctl reload nginx
 
   if [[ -f "$SCHEMA_FILE" ]]; then
-    mysql -uroot -proot -e "CREATE DATABASE IF NOT EXISTS ${DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-    mysql -uroot -proot ${DB_NAME} < "$SCHEMA_FILE"
+    mysql -uroot -p${MYSQL_ROOT_PASS} -e "CREATE DATABASE IF NOT EXISTS ${DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    mysql -uroot -p${MYSQL_ROOT_PASS} ${DB_NAME} < "$SCHEMA_FILE"
     log "[${DB_NAME} DB schema imported]"
+  elif [[ "${ENGINE_NAME}" == "tfs" ]]; then
+    # For TFS engines, check if database already exists (created by engine script)
+    if mysql -uroot -p${MYSQL_ROOT_PASS} -e "USE ${DB_NAME};" 2>/dev/null; then
+      log "[${DB_NAME} DB already exists, skipping schema import]"
+    else
+      log "[${DB_NAME} DB not found, creating empty database]"
+      mysql -uroot -p${MYSQL_ROOT_PASS} -e "CREATE DATABASE IF NOT EXISTS ${DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    fi
   fi
 
   if [[ ! -d /var/www/html ]] || [[ ! -f /var/www/html/composer.json ]]; then
@@ -416,40 +471,31 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
   ln -snf /usr/share/phpmyadmin /var/www/html/php_adm
 
   # --------- COMPOSER INSTALL (FASTER!) ---------
-  run_apt_fast "apt-get install -y $APT_FAST composer"
-
+  # Composer already installed above in batch
   if [[ -f /var/www/html/composer.json ]] && [[ ! -f /var/www/html/vendor/autoload.php ]]; then
     cd /var/www/html
     kill_blockers
-    trycmd "timeout 1200 $EAT composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts" 3 60 || die "Composer install failed"
+    # Use parallel downloads and disable dev dependencies for speed
+    trycmd "timeout 1200 $EAT composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts --prefer-dist --no-suggest" 3 60 || die "Composer install failed"
   fi
 
   chown -R www-data:www-data /var/www/html
   [[ -d /var/www/html/images       ]] && find /var/www/html/images        -type f -exec chmod 660 {} \;
   [[ -d /var/www/html/system/cache ]] && find /var/www/html/system/cache -type f -exec chmod 760 {} \;
 
-  kill_blockers
-  run_apt_fast "apt-get install -y $APT_FAST composer"
+  # Composer already installed above in batch
   cd /var/www/html
   if [[ -f composer.json ]]; then
     kill_blockers
-    trycmd "timeout 1200 $EAT composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts" 3 60 || die "Composer install failed"
+    trycmd "timeout 1200 $EAT composer install --no-dev --optimize-autoloader --no-interaction --no-plugins --no-scripts --prefer-dist --no-suggest" 3 60 || die "Composer install failed"
   fi
 
-  # ─────────────────────────── 4/7: Vcpkg & manifest-mode ──────────────────────────────
-  if ! command -v node &>/dev/null; then
-    kill_blockers
-    curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-    kill_blockers
-    run_apt_fast "apt-get install -y $APT_FAST nodejs"
-  fi
-  if ! command -v npm &>/dev/null; then
-    kill_blockers
-    run_apt_fast "apt-get install -y $APT_FAST npm"
-  fi
+  # ─────────────────────────── 4/7: Node.js & npm (already installed above) ──────────────────────────────
+  # Node.js and npm already installed above in batch
+  cd /var/www/html
   if [[ -f package.json ]]; then
     kill_blockers
-    trycmd "timeout 500 $EAT npm install" 3 30 || die "npm install failed"
+    trycmd "timeout 500 $EAT npm install --production --no-optional" 3 30 || die "npm install failed"
   fi
 
   chown -R www-data:www-data /var/www/html
@@ -459,7 +505,7 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
   # Find the first php*-fpm.sock ( e.g. php8.3-fpm.sock )
   phpfpm_sock=$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n1)
   if [ -n "$phpfpm_sock" ]; then
-    # Strip “.sock” to get “php8.3-fpm” ( or whatever version is installed )
+    # Strip “.sock” to get “php8.3-fpm” ( or whatever version is installed- )
     phpfpm_service=$(basename "$phpfpm_sock" .sock)
     log "Re-starting $phpfpm_service service"
     systemctl enable "$phpfpm_service"
@@ -472,8 +518,8 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
   success=1
 
   # ─────── install GD & ZIP extensions, required for MyAcc plugins ───────
-  log "Installing PHP GD & ZIP extensions"
-  run_apt_fast "apt-get install -y $APT_FAST php-gd php-zip"
+  # PHP GD & ZIP extensions already installed above in batch
+  log "PHP GD & ZIP extensions already installed"
 
   # reload FPM so it picks up the new modules
   php_fpm_svc=$(basename "$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n1)" .sock)
@@ -497,8 +543,9 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
   CONFIG_DIST="${CONFIG_FILE}.dist"
 
   if [[ -f "${PMA_CRED_FILE}" ]]; then
-    PMA_USER=$(awk '/phpMyAdmin super-user:/ {getline; print $2}' "${PMA_CRED_FILE}")
-    PMA_PASS=$(awk '/phpMyAdmin super-user:/ {getline; getline; print $2}' "${PMA_CRED_FILE}")
+    PMA_USER=$(awk '/phpMyAdmin Super-User/ {getline; print $2}' "${PMA_CRED_FILE}")
+    PMA_PASS=$(awk '/phpMyAdmin Super-User/ {getline; getline; print $2}' "${PMA_CRED_FILE}")
+    log "Extracted PMA_USER: '${PMA_USER}', PMA_PASS: '${PMA_PASS}' from ${PMA_CRED_FILE}"
   else
     log "⚠️ Could not find PMA_CRED_FILE (${PMA_CRED_FILE}), skipping config.lua patch."
     PMA_USER=""
@@ -513,13 +560,21 @@ printf 'Canary/&MyAcc grants:\n  User: %s\n  Pass: %s\n' \
 
     if [[ -f "${CONFIG_FILE}" ]]; then
       log "Patching MyAAC ${ENGINE_NAME} config.lua MySQL settings..."
+      log "Before patch - mysqlUser: $(grep '^mysqlUser' "${CONFIG_FILE}" || echo 'not found')"
+      log "Before patch - mysqlPass: $(grep '^mysqlPass' "${CONFIG_FILE}" || echo 'not found')"
+      
       sed -i \
         -e "s/^mysqlUser = \".*\"/mysqlUser = \"${PMA_USER}\"/" \
         -e "s/^mysqlPass = \".*\"/mysqlPass = \"${PMA_PASS}\"/" \
+        -e "s/^mysqlPass = \"PLACEHOLDER_PASSWORD\"/mysqlPass = \"${PMA_PASS}\"/" \
         -e "s/^mysqlDatabase = \".*\"/mysqlDatabase = \"${DB_NAME}\"/" \
         "${CONFIG_FILE}"
       
+      log "After patch - mysqlUser: $(grep '^mysqlUser' "${CONFIG_FILE}" || echo 'not found')"
+      log "After patch - mysqlPass: $(grep '^mysqlPass' "${CONFIG_FILE}" || echo 'not found')"
+      
       # Add passwordType = "sha1" for TFS
+      # Why is it even missing in the first place?
       if [[ "${ENGINE_NAME}" == "tfs" ]]; then
         # Check if passwordType already exists
         if ! grep -q "^passwordType" "${CONFIG_FILE}"; then
