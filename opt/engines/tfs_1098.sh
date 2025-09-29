@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # ────────────────────────── Config ──────────────────────────
-CACHE_URL="http://cache.yourotserver.com/cache/forgottenserver-1.4.2.zip"
+CACHE_URL="http://cache.yourotserver.com/cache/forgottenserver-1.4.2.zip" # cache url for the source zip
 ZIP_NAME="forgottenserver-1.4.2.zip"
-SRC_DIR_NAME="forgottenserver-1.4.2"   # how the zip extracts
+SRC_DIR_NAME="forgottenserver-1.4.2"   # how the zip extracts, this is the temporary directory name, rename to tfs for web-engine scripts
 
 log(){ echo -e "\n>>> $*"; }
 die(){ echo -e "\nERROR: $*" >&2; exit 1; }
@@ -25,6 +25,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 # ────────────────────────── UFW ─────────────────────────────
 log "Configuring UFW (allow 7171/tcp, 7172/tcp) and enabling firewall…"
+ufw allow OpenSSH || ufw allow 22/tcp || true
 ufw allow 7171/tcp || true
 ufw allow 7172/tcp || true
 # Enable UFW if not already enabled
