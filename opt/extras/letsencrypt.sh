@@ -21,6 +21,8 @@ log(){ echo -e "\n>>> $*"; }
 die(){ echo -e "\nERROR: $*" >&2; exit 1; }
 
 # ────────────────────────── Email and Domain Validation ──────────────────────────
+# Required to register for a certificate, need to be checked before running the script
+# Otherwise we risk getting a certificate for the wrong email or domain, or not getting a certificate at all with files laying on machine
 log "Validating email and domain format..."
 
 # Email validation regex
@@ -35,6 +37,7 @@ if [[ ! $DOMAIN =~ $DOMAIN_REGEX ]]; then
     die "Invalid domain format: $DOMAIN"
 fi
 
+# Image using for easier identification in logs, check if the email and domain format is valid
 log "✅ Email and domain format validation passed"
 
 # ────────────────────────── Pre-flight checks ──────────────────────────
@@ -84,6 +87,7 @@ iptables -A INPUT -p tcp --dport 443 -m state --state NEW -m recent --update --s
 iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 
 # Save iptables rules
+# Required for the persistence, otherwise the rules will be lost after reboot
 iptables-save > /etc/iptables/rules.v4
 log "✅ iptables rules configured for Nginx Full with DDoS protection"
 
@@ -121,6 +125,7 @@ log "✅ Updated nginx server_name to: $DOMAIN www.$DOMAIN"
 log "Preparing nginx configuration for Let's Encrypt validation..."
 
 # Create a temporary nginx config that allows Let's Encrypt validation
+# This will be replaced by the final nginx config after the certificate is obtained
 cat > "$NGINX_CONFIG" <<EOF
 # Temporary nginx config for Let's Encrypt validation
 server {
@@ -143,6 +148,7 @@ server {
 EOF
 
 # Test and reload nginx
+# Required to apply the changes to the nginx config
 nginx -t || die "Nginx configuration test failed"
 systemctl reload nginx
 
@@ -261,6 +267,7 @@ systemctl reload nginx
 log "Setting up automatic certificate renewal..."
 
 # Create a renewal test script
+# Required to test the renewal process, does it work as expected?
 cat > /usr/local/bin/certbot-renewal-test.sh <<'EOF'
 #!/bin/bash
 # Test script for Let's Encrypt renewal
@@ -299,6 +306,7 @@ fi
 log "Performing final verification..."
 
 # Check if certificate files exist
+# Make sure the certificate files are present
 if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" && -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]]; then
     log "✅ SSL certificate files are present"
 else
@@ -344,4 +352,5 @@ if [[ -f "$BACKUP_CONFIG" ]]; then
     rm -f "$BACKUP_CONFIG"
 fi
 
+# Log for worker to know that the script has finished
 log "Done, Let's Encrypt SSL setup completed successfully!"
