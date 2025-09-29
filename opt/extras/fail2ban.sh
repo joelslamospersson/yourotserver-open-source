@@ -469,7 +469,8 @@ declare -A filters=(
   [php-adm-bruteforce]='.*"(GET|POST) /php_adm.*" (401|403)'
   [bad-bots]='.*"(curl|sqlmap|nikto|acunetix|fuzzer|nmap|python-requests|ZmEu|netsparker)".*'
   [sql-injection]='.*(union.*select| or 1=1|--|select.*from).*'
-  [shell-upload]='.*(\.php|\.jsp|\.exe|\.asp|\.py|cmd=|php\?eval|shell\.php).*'
+  # Narrow shell-upload to POST/PUT into uploads/tmp with dangerous extensions
+  [shell-upload]='.*"(POST|PUT) .*(/(uploads|tmp)/[^ ]*\.(php|jsp|exe|asp|py))"'
   [directory-traversal]='.*(\.\./|%%2e%%2e/).*'
   [suspicious-file-upload]='.*POST .*(/(uploads|tmp)/.*\.(php|jsp|exe|asp|py)).*'
   [api-abuse]='.*"(GET|POST) /(api/token|auth).*" (401|403)'
