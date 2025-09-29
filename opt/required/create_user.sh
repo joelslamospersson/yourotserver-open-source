@@ -14,19 +14,37 @@ USER_CRED="${USER_HOME}/user.txt"     # for the created user
 
 echo "=== $(date): create_user.sh starting for user '$TARGET_USER' ==="
 
-# � 1) generate or reuse a 58�64 char password
+# 1) generate or reuse a 5864 char password
 if id "$TARGET_USER" &>/dev/null && [[ -r "$ROOT_CRED" ]]; then
   echo "User '$TARGET_USER' already exists; re-using existing password."
   PASSWORD=$( sed -n 's/^Password: //p' "$ROOT_CRED" )
 else
-  LENGTH=$(( RANDOM % 7 + 58 ))   # 58�64
-  PASSWORD=$( head -c 128 /dev/urandom \
-    | tr -dc 'A-Za-z0-9!@#$%^&*()-_=+[]{}|;:,.<>?/' \
-    | head -c "$LENGTH" )
-  echo "Generated password of length $LENGTH."
+  LENGTH=$(( RANDOM % 7 + 58 ))   # 5864
+  
+  # Generate password with required character types
+  # Ensure at least one of each: lowercase, uppercase, special (!#%), number
+  # Required to be secure, otherwise the password will be weak and easy to guess, avoiding other characters due to incompatibility with old code
+  PASSWORD=""
+  
+  # Add required characters first
+  PASSWORD+=$(echo -n "abcdefghijklmnopqrstuvwxyz" | fold -w1 | shuf | head -c1)  # lowercase
+  PASSWORD+=$(echo -n "ABCDEFGHIJKLMNOPQRSTUVWXYZ" | fold -w1 | shuf | head -c1)  # uppercase
+  PASSWORD+=$(echo -n "!#%" | fold -w1 | shuf | head -c1)                          # special
+  PASSWORD+=$(echo -n "0123456789" | fold -w1 | shuf | head -c1)                   # number
+  
+  # Fill remaining length with random characters from all allowed sets
+  REMAINING_LENGTH=$((LENGTH - 4))
+  PASSWORD+=$(head -c 128 /dev/urandom \
+    | tr -dc 'a-zA-Z0-9!#%' \
+    | head -c "$REMAINING_LENGTH")
+  
+  # Shuffle the password to randomize character positions
+  PASSWORD=$(echo -n "$PASSWORD" | fold -w1 | shuf | tr -d '\n')
+  
+  echo "Generated password of length $LENGTH with required character types."
 fi
 
-# � 2) create/check the OS user
+# 2) create/check the OS user
 if id "$TARGET_USER" &>/dev/null; then
   echo "User '$TARGET_USER' already exists."
 else
@@ -42,12 +60,12 @@ fi
 mkdir -p "$USER_HOME"
 chown -R "$TARGET_USER:$TARGET_USER" "$USER_HOME"
 
-# ��2.5) actually set that password on the account so SSH will accept it
+# 2.5) actually set that password on the account so SSH will accept it
 echo "${TARGET_USER}:${PASSWORD}" | chpasswd \
   || { echo "ERROR: failed to set password for ${TARGET_USER}" >&2; exit 1; }
 
 
-# � 3) write both credential files
+# 3) write both credential files
 mkdir -p "$USER_HOME"
 chown "$TARGET_USER:$TARGET_USER" "$USER_HOME"
 {
@@ -66,7 +84,7 @@ chmod 600 "$USER_CRED"
 chown "$TARGET_USER":"$TARGET_USER" "$USER_CRED"
 echo "Wrote user-owned creds to $USER_CRED."
 
-# � 4) ensure passwordless sudo
+# 4) ensure passwordless sudo
 if id -nG "$TARGET_USER" | grep -qw sudo; then
   echo "User '$TARGET_USER' is already in sudo group."
 else
